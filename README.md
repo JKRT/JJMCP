@@ -37,10 +37,23 @@ build/jjmcp serve
 
 `serve` runs MCP JSON-RPC over stdio. During MCP mode, stdout is reserved for MCP frames only; diagnostics go to stderr.
 
-Install:
+## Install
 
 ```sh
 make install PREFIX=/usr/local
+```
+
+After install, use the installed command:
+
+```sh
+jjmcp --help
+jjmcp serve
+```
+
+If `$(PREFIX)/bin` is not on `PATH`, use the full installed path instead:
+
+```sh
+/usr/local/bin/jjmcp serve
 ```
 
 Staged/package install:
@@ -48,6 +61,8 @@ Staged/package install:
 ```sh
 make install DESTDIR=/tmp/jjmcp-package PREFIX=/usr
 ```
+
+A staged install writes files under `$(DESTDIR)$(PREFIX)` for packaging. It does not make `/tmp/jjmcp-package/usr/bin/jjmcp` the normal runtime path unless you explicitly run that staged binary. After package installation, the runtime command path would be `/usr/bin/jjmcp`.
 
 Installed files:
 
@@ -61,13 +76,13 @@ Installed files:
 
 ## MCP Client Examples
 
-Use an absolute path to `build/jjmcp`.
+Use an absolute path to the executable. If you have run `make install PREFIX=/usr/local`, use `/usr/local/bin/jjmcp`. If you have not installed JJMCP, use the absolute path to `build/jjmcp` in your checkout.
 
 Codex CLI style TOML:
 
 ```toml
 [mcp_servers.jjmcp]
-command = "/home/you/Projects/JJMCP/build/jjmcp"
+command = "/usr/local/bin/jjmcp"
 args = ["serve"]
 ```
 
@@ -77,7 +92,7 @@ Claude Code style JSON:
 {
   "mcpServers": {
     "jjmcp": {
-      "command": "/home/you/Projects/JJMCP/build/jjmcp",
+      "command": "/usr/local/bin/jjmcp",
       "args": ["serve"]
     }
   }
@@ -87,7 +102,7 @@ Claude Code style JSON:
 Claude Code command form:
 
 ```sh
-claude mcp add jjmcp /home/you/Projects/JJMCP/build/jjmcp serve
+claude mcp add jjmcp /usr/local/bin/jjmcp serve
 ```
 
 ## tmux Workflow
