@@ -1,0 +1,91 @@
+.TH JJMCP 1 "May 2026" "JJMCP 0.1.0" "User Commands"
+.SH NAME
+jjmcp \- local MCP server for a tmux Julia REPL
+.SH SYNOPSIS
+.B jjmcp
+.B --help
+.br
+.B jjmcp
+.B serve
+.SH DESCRIPTION
+.B JohnJuliaMCP
+(
+.B JJMCP
+) is a local JSON-RPC 2.0 MCP server that lets MCP clients work through an existing tmux pane running Julia.
+The tmux Julia REPL is treated as the source of truth.
+JJMCP does not start hidden Julia workers by default.
+.PP
+In
+.B serve
+mode, stdout is reserved for MCP protocol frames.
+Diagnostics are written to stderr.
+.SH COMMANDS
+.TP
+.B --help
+Print usage to stdout and exit.
+.TP
+.B serve
+Run MCP over stdio.
+.SH MCP TOOLS
+.TP
+.B jjmcp_list_tmux
+List tmux sessions, windows, panes, pane ids, active process names, titles, and current paths.
+.TP
+.B jjmcp_bind
+Bind to an existing tmux pane.
+Arguments:
+.B target
+and optional
+.B project_root.
+.TP
+.B jjmcp_status
+Report the current binding, pane information, marker state, timestamp, and liveness.
+.TP
+.B jjmcp_eval
+Evaluate Julia code in the bound pane.
+Arguments:
+.B code,
+optional
+.B timeout_ms,
+and optional
+.B capture_lines.
+.TP
+.B jjmcp_capture
+Capture recent pane output without sending input.
+.TP
+.B jjmcp_interrupt
+Send Ctrl-C to the bound pane.
+.TP
+.B jjmcp_revise
+Run
+.B Revise.revise()
+in the bound pane.
+.TP
+.B jjmcp_activate
+Run
+.B using Pkg; Pkg.activate(path)
+in the bound pane.
+.TP
+.B jjmcp_test
+Run focused Julia tests in the existing REPL context.
+.SH EXAMPLES
+.nf
+tmux new-session -s julia
+julia --project=.
+
+build/jjmcp serve
+.fi
+.PP
+From an MCP client, call
+.B jjmcp_list_tmux,
+then bind to the desired pane id with
+.B jjmcp_bind.
+.SH FILES
+.TP
+.I .jjmcp/config.json
+Optional local binding persistence file.
+.SH SEE ALSO
+.BR jjmcp-config (5),
+.BR jjmcp-security (7),
+.BR tmux (1),
+.BR julia (1)

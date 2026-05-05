@@ -1,0 +1,30 @@
+.TH JJMCP-SECURITY 7 "May 2026" "JJMCP 0.1.0" "Miscellaneous Information"
+.SH NAME
+jjmcp-security \- security model for JohnJuliaMCP
+.SH DESCRIPTION
+JJMCP is a local trusted tool.
+It can execute arbitrary Julia code in the tmux pane selected by
+.B jjmcp_bind.
+.PP
+Only expose this MCP server to trusted local clients.
+Do not run it as a network service, do not bind it to an untrusted tmux pane, and do not give untrusted agents access to it.
+.SH RISKS
+.IP \(bu 2
+.B jjmcp_eval,
+.B jjmcp_test,
+.B jjmcp_activate,
+and
+.B jjmcp_revise
+execute code in the user's Julia process.
+.IP \(bu 2
+Julia code is not sandboxed and runs with the user's permissions.
+.IP \(bu 2
+The bound pane is shared mutable state.
+Manual user input or other automation can affect later evaluations.
+.IP \(bu 2
+Julia code can read, write, or delete files accessible to the user.
+.SH RECOMMENDATION
+Use JJMCP only on machines and repositories where local code execution by the connected MCP client is acceptable.
+.SH SEE ALSO
+.BR jjmcp (1),
+.BR jjmcp-config (5)

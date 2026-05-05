@@ -1,0 +1,40 @@
+.TH JJMCP-CONFIG 5 "May 2026" "JJMCP 0.1.0" "File Formats"
+.SH NAME
+jjmcp-config \- local binding configuration for JohnJuliaMCP
+.SH DESCRIPTION
+JJMCP persists the most recent tmux binding in a JSON file at
+.I .jjmcp/config.json
+under the supplied
+.B project_root,
+or under the server current working directory if no project root is supplied.
+.PP
+The file is local project state.
+It is not required for MCP operation; a client can always call
+.B jjmcp_bind
+again.
+.SH FORMAT
+.nf
+{
+  "binding": {
+    "target": "%3",
+    "pane_id": "%3",
+    "project_root": "/path/to/project",
+    "bound_at": "2026-05-05T11:30:00+0200"
+  }
+}
+.fi
+.SH FIELDS
+.TP
+.B target
+The tmux target originally supplied by the caller.
+.TP
+.B pane_id
+The resolved tmux pane id. JJMCP prefers this for later operations.
+.TP
+.B project_root
+The optional project root supplied by the caller.
+.TP
+.B bound_at
+Local timestamp when the binding was created.
+.SH SEE ALSO
+.BR jjmcp (1)
