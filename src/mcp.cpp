@@ -2,21 +2,11 @@
 
 #include "tools.hpp"
 
-#include <algorithm>
-#include <cctype>
 #include <iostream>
 #include <sstream>
 
 namespace jjmcp {
 namespace {
-
-std::string lowercase(std::string text)
-{
-    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) {
-        return static_cast<char>(std::tolower(c));
-    });
-    return text;
-}
 
 nlohmann::json request_id_or_null(const nlohmann::json& request)
 {
@@ -43,58 +33,32 @@ nlohmann::json tool_result_json(const ToolResult& result)
 
 } // namespace
 
+// MCP stdio transport per spec: messages are newline-delimited JSON-RPC,
+// one JSON object per line, with no Content-Length headers. Embedded
+// newlines inside the JSON body are forbidden (and nlohmann::json::dump()
+// with no indent argument already produces single-line output, so encoding
+// reduces to a single trailing '\n'). Tolerate CRLF on input and skip blank
+// lines defensively.
+//
+// Reference: https://spec.modelcontextprotocol.io/specification/basic/transports/#stdio
 Result<ReadMessage> read_mcp_message(std::istream& input)
 {
     std::string line;
-    std::size_t content_length = 0;
-    bool saw_header = false;
-
     while (std::getline(input, line)) {
         if (!line.empty() && line.back() == '\r') {
             line.pop_back();
         }
         if (line.empty()) {
-            break;
+            continue;  // skip blank separators
         }
-        saw_header = true;
-        const auto colon = line.find(':');
-        if (colon == std::string::npos) {
-            continue;
-        }
-        auto name = lowercase(line.substr(0, colon));
-        auto value = line.substr(colon + 1);
-        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
-            value.erase(value.begin());
-        }
-        if (name == "content-length") {
-            try {
-                content_length = static_cast<std::size_t>(std::stoull(value));
-            } catch (...) {
-                return Result<ReadMessage>::failure("invalid Content-Length header");
-            }
-        }
+        return Result<ReadMessage>::success(ReadMessage{false, std::move(line)});
     }
-
-    if (!input && !saw_header) {
-        return Result<ReadMessage>::success(ReadMessage{true, {}});
-    }
-    if (content_length == 0) {
-        return Result<ReadMessage>::failure("missing Content-Length header");
-    }
-
-    std::string body(content_length, '\0');
-    input.read(body.data(), static_cast<std::streamsize>(content_length));
-    if (static_cast<std::size_t>(input.gcount()) != content_length) {
-        return Result<ReadMessage>::failure("short read while reading message body");
-    }
-
-    return Result<ReadMessage>::success(ReadMessage{false, std::move(body)});
+    return Result<ReadMessage>::success(ReadMessage{true, {}});
 }
 
 void write_mcp_message(std::ostream& output, const nlohmann::json& message)
 {
-    const std::string body = message.dump();
-    output << "Content-Length: " << body.size() << "\r\n\r\n" << body;
+    output << message.dump() << '\n';
     output.flush();
 }
 
