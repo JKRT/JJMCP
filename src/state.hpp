@@ -22,6 +22,9 @@ struct ServerState {
     std::string last_marker;
     std::string last_command_timestamp;
     unsigned long long marker_sequence = 0;
+    // Per-process upper bound on tool timeout_ms. Overridable via JJMCP_TIMEOUT_MS_MAX env var.
+    // Default matches the original compile-time clamp of 600000 ms (10 min).
+    int max_timeout_ms = 600000;
 };
 
 std::filesystem::path default_config_path(const std::filesystem::path& base);

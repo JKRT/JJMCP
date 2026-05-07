@@ -1,8 +1,10 @@
+#include "log.hpp"
 #include "mcp.hpp"
 #include "state.hpp"
 #include "tmux.hpp"
 #include "tools.hpp"
 
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -20,7 +22,29 @@ void print_usage()
         << "  jjmcp serve\n"
         << "\n"
         << "Commands:\n"
-        << "  serve   Run MCP JSON-RPC over stdio. stdout is reserved for MCP frames.\n";
+        << "  serve   Run MCP JSON-RPC over stdio. stdout is reserved for MCP frames.\n"
+        << "\n"
+        << "Environment:\n"
+        << "  JJMCP_TIMEOUT_MS_MAX  Override the per-tool timeout_ms upper bound (default 600000).\n"
+        << "  JJMCP_LOG_FORMAT      Set to 'json' for one-JSON-object-per-line stderr logs (default 'text').\n";
+}
+
+void apply_env_overrides(jjmcp::ServerState& state)
+{
+    if (const char* env = std::getenv("JJMCP_TIMEOUT_MS_MAX")) {
+        try {
+            const int parsed = std::stoi(env);
+            if (parsed > 0) {
+                state.max_timeout_ms = parsed;
+            } else {
+                jjmcp::log::warn("env_override_ignored",
+                                 {{"name", "JJMCP_TIMEOUT_MS_MAX"}, {"value", env}, {"reason", "must be a positive integer"}});
+            }
+        } catch (const std::exception&) {
+            jjmcp::log::warn("env_override_ignored",
+                             {{"name", "JJMCP_TIMEOUT_MS_MAX"}, {"value", env}, {"reason", "could not parse as integer"}});
+        }
+    }
 }
 
 int serve()
@@ -33,11 +57,27 @@ int serve()
     std::error_code ec;
     const auto cwd = std::filesystem::current_path(ec);
     state.config_path = default_config_path(ec ? std::filesystem::path(".") : cwd);
+    apply_env_overrides(state);
     if (const auto loaded = load_config(state); !loaded) {
-        std::cerr << "jjmcp: warning: " << loaded.error() << '\n';
+        log::warn("config_load_failed", {{"error", loaded.error()}});
     }
 
     const Tmux tmux;
+    if (state.binding) {
+        const auto info = tmux.pane_info(state.binding->pane_id.empty() ? state.binding->target : state.binding->pane_id);
+        if (!info || !info.value().alive()) {
+            log::warn("stale_binding_cleared",
+                      {{"target", state.binding->target},
+                       {"pane_id", state.binding->pane_id},
+                       {"reason", info ? "pane is dead" : info.error()}});
+            state.binding.reset();
+        }
+    }
+    log::info("server_started",
+              {{"config_path", state.config_path.string()},
+               {"max_timeout_ms", state.max_timeout_ms},
+               {"bound", state.binding.has_value()}});
+
     ToolDispatcher tools(state, tmux, ec ? std::filesystem::path(".") : cwd);
 
     for (;;) {

@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: build-ubuntu-24.04
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config nlohmann-json3-dev tmux jq
+
+      - name: Show toolchain
+        run: |
+          c++ --version
+          pkg-config --modversion nlohmann_json
+          tmux -V
+
+      - name: check-deps
+        run: make check-deps
+
+      - name: build
+        run: make
+
+      - name: test
+        run: make test
+
+      - name: Install Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+
+      - name: integration tests
+        run: JJMCP_INTEGRATION=1 make test-integration

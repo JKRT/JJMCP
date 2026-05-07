@@ -1,5 +1,6 @@
 #include "mcp.hpp"
 
+#include "progress.hpp"
 #include "tools.hpp"
 
 #include <iostream>
@@ -27,6 +28,9 @@ nlohmann::json tool_result_json(const ToolResult& result)
     payload["content"] = nlohmann::json::array({{{"type", "text"}, {"text", result.text}}});
     if (result.is_error) {
         payload["isError"] = true;
+    }
+    if (!result.structured.is_null()) {
+        payload["structuredContent"] = result.structured;
     }
     return payload;
 }
@@ -98,7 +102,10 @@ std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request
     if (method == "initialize") {
         nlohmann::json result;
         result["protocolVersion"] = "2024-11-05";
-        result["capabilities"] = {{"tools", nlohmann::json::object()}};
+        result["capabilities"] = {
+            {"tools", nlohmann::json::object()},
+            {"resources", {{"listChanged", false}}},
+        };
         result["serverInfo"] = {{"name", "JohnJuliaMCP"}, {"version", "0.1.0"}};
         return make_jsonrpc_result(id, std::move(result));
     }
@@ -109,6 +116,25 @@ std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request
 
     if (method == "tools/list") {
         return make_jsonrpc_result(id, {{"tools", tools.list_tools_json()}});
+    }
+
+    if (method == "resources/list") {
+        return make_jsonrpc_result(id, {{"resources", tools.list_resources_json()}});
+    }
+
+    if (method == "resources/read") {
+        if (!request.contains("params") || !request["params"].is_object()) {
+            return make_jsonrpc_error(id, -32602, "resources/read params must be an object");
+        }
+        const auto& params = request["params"];
+        if (!params.contains("uri") || !params["uri"].is_string()) {
+            return make_jsonrpc_error(id, -32602, "resources/read params.uri must be a string");
+        }
+        const auto contents = tools.read_resource(params["uri"]);
+        if (!contents) {
+            return make_jsonrpc_error(id, -32002, contents.error());
+        }
+        return make_jsonrpc_result(id, contents.value());
     }
 
     if (method == "tools/call") {
@@ -126,8 +152,13 @@ std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request
             }
             arguments = params["arguments"];
         }
-
-        const auto result = tools.call(params["name"], arguments);
+        nlohmann::json progress_token = nullptr;
+        if (params.contains("_meta") && params["_meta"].is_object()
+            && params["_meta"].contains("progressToken")) {
+            progress_token = params["_meta"]["progressToken"];
+        }
+        ProgressEmitter emitter(std::cout, std::move(progress_token));
+        const auto result = tools.call(params["name"], arguments, &emitter);
         return make_jsonrpc_result(id, tool_result_json(result));
     }
 

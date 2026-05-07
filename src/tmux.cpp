@@ -174,7 +174,12 @@ Result<void> Tmux::send_text(const std::string& target, const std::string& text,
 
 Result<void> Tmux::send_ctrl_c(const std::string& target) const
 {
-    const auto result = run_tmux({"send-keys", "-t", target, "C-c"});
+    return send_key(target, "C-c");
+}
+
+Result<void> Tmux::send_key(const std::string& target, const std::string& key) const
+{
+    const auto result = run_tmux({"send-keys", "-t", target, key});
     if (!result) {
         return Result<void>::failure(result.error());
     }

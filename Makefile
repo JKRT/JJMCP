@@ -24,8 +24,11 @@ LDLIBS += $(JSON_LIBS)
 
 LIB_SRCS := \
 	$(SRC_DIR)/julia_wrap.cpp \
+	$(SRC_DIR)/log.cpp \
 	$(SRC_DIR)/mcp.cpp \
 	$(SRC_DIR)/process.cpp \
+	$(SRC_DIR)/progress.cpp \
+	$(SRC_DIR)/socket_client.cpp \
 	$(SRC_DIR)/state.cpp \
 	$(SRC_DIR)/tmux.cpp \
 	$(SRC_DIR)/tools.cpp
@@ -36,7 +39,7 @@ TEST_SRCS := $(TEST_DIR)/test_main.cpp $(LIB_SRCS)
 APP_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(APP_SRCS))
 TEST_OBJS := $(patsubst %.cpp,$(BUILD_DIR)/%.o,$(TEST_SRCS))
 
-.PHONY: all test clean check-deps install uninstall help
+.PHONY: all test test-integration clean check-deps install uninstall help
 
 all: $(BUILD_DIR)/jjmcp
 
@@ -45,6 +48,7 @@ help:
 		'Targets:' \
 		'  make          Build build/jjmcp' \
 		'  make test     Build and run unit tests' \
+		'  make test-integration  Run integration tests (requires JJMCP_INTEGRATION=1)' \
 		'  make install  Install jjmcp, man pages, and docs' \
 		'  make clean    Remove build outputs' \
 		'  make check-deps  Check compiler, pkg-config, nlohmann_json, and tmux' \
@@ -70,6 +74,16 @@ $(BUILD_DIR)/%.o: %.cpp
 
 test: $(BUILD_DIR)/jjmcp-tests
 	$(BUILD_DIR)/jjmcp-tests
+
+# Integration tests drive the actual build/jjmcp binary (and a real tmux+julia in the tmux fixture
+# test). Gated on JJMCP_INTEGRATION=1 so `make test` stays fast and free of system-tool dependencies.
+test-integration: $(BUILD_DIR)/jjmcp
+	@if [ "$$JJMCP_INTEGRATION" != "1" ]; then \
+		echo "Set JJMCP_INTEGRATION=1 to run integration tests."; exit 1; \
+	fi
+	@./tests/integration/test_mcp_conformance.sh
+	@./tests/integration/test_tmux_fixture.sh
+	@./tests/integration/test_socket_fixture.sh
 
 install: $(BUILD_DIR)/jjmcp
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"

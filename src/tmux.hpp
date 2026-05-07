@@ -32,6 +32,8 @@ public:
     Result<std::string> capture_pane(const std::string& target, int lines) const;
     Result<void> send_text(const std::string& target, const std::string& text, const std::string& buffer_name) const;
     Result<void> send_ctrl_c(const std::string& target) const;
+    // Send a single tmux key spec (e.g. "BSpace", "Enter", "C-c") to the bound pane.
+    Result<void> send_key(const std::string& target, const std::string& key) const;
 
 private:
     Result<ProcessResult> run_tmux(
