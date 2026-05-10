@@ -118,14 +118,14 @@ std::filesystem::path config_base_from_project(const std::filesystem::path& cwd,
     return path.lexically_normal();
 }
 
-// Run `julia --startup-file=no -e '...'` with the user's code on stdin, asking Julia to parse it
+// Run `julia -e '...'` with the user's code on stdin, asking Julia to parse it
 // without executing anything. Returns the parser diagnostic text on failure. Bounded to 2 seconds
 // so a Julia start-up hang cannot stall the eval pipeline. The user must have julia on PATH; if
 // not, validation is skipped (we cannot know, so we trust the agent and the live REPL).
 Result<void> validate_julia_syntax(const std::string& code)
 {
     RunSpec spec;
-    spec.argv = {"julia", "--startup-file=no", "--color=no", "-e",
+    spec.argv = {"julia", "--color=no", "-e",
                  "try; Meta.parse(read(stdin, String); raise=true); print(\"ok\"); catch e; "
                  "showerror(stderr, e); exit(1); end"};
     spec.stdin_data = code;
@@ -275,7 +275,7 @@ nlohmann::json ToolDispatcher::list_tools_json() const
                 {"timeout_ms", {{"type", "integer"}, {"minimum", 1}, {"maximum", state_.max_timeout_ms}}},
                 {"capture_lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", kMaxCaptureLines}}},
                 {"force", {{"type", "boolean"}, {"description", "skip pane-mode pre-check (default false)"}}},
-                {"validate_syntax", {{"type", "boolean"}, {"description", "parse code via a 2s julia --startup-file=no Meta.parse before paste (default true)"}}},
+                {"validate_syntax", {{"type", "boolean"}, {"description", "parse code via a 2s julia Meta.parse before paste (default true)"}}},
                 {"transport", {{"type", "string"}, {"enum", nlohmann::json::array({"auto", "tmux", "socket"})}, {"description", "auto (default), tmux (force marker path), or socket (require JJMCPHelper.jl)"}}},
             },
             nlohmann::json::array({"code"})),
@@ -672,8 +672,10 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
     std::string last_capture;
     ExtractedOutput last_extract;
     bool timed_out = false;
+    bool begin_trimmed = false;
 
     constexpr std::size_t kProgressMinDelta = 4096;
+    constexpr std::size_t kProgressMaxTail = 4096;
     std::size_t last_progress_size = 0;
     int progress_count = 0;
 
@@ -708,13 +710,31 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
             last_extract = extract_between_markers(accumulator, marker);
         }
 
+        // Once BEGIN is located anywhere, discard all pre-BEGIN pane history from the accumulator.
+        // Future extraction passes only need to scan from BEGIN onward, keeping the working set
+        // bounded by actual output size rather than total pane history.
+        if (!begin_trimmed && last_extract.found_begin) {
+            const auto begin_pos = accumulator.find(marker.begin);
+            if (begin_pos != std::string::npos) {
+                const auto line_start = accumulator.rfind('\n', begin_pos);
+                const std::size_t trim_to = (line_start == std::string::npos) ? 0 : line_start + 1;
+                if (trim_to > 0) {
+                    accumulator.erase(0, trim_to);
+                }
+            }
+            begin_trimmed = true;
+        }
+
         // Emit a progress notification when the in-progress output between markers grows by at
-        // least kProgressMinDelta bytes. The agent receives a streaming view of stdout/stderr from
-        // the eval as it runs, plus a monotonic count.
+        // least kProgressMinDelta bytes. Cap the tail per notification to avoid megabyte frames
+        // when a large value is printed all at once.
         if (progress != nullptr && progress->active() && last_extract.found_begin) {
             const std::size_t cur = last_extract.text.size();
             if (cur >= last_progress_size + kProgressMinDelta) {
                 std::string tail = last_extract.text.substr(last_progress_size);
+                if (tail.size() > kProgressMaxTail) {
+                    tail = tail.substr(tail.size() - kProgressMaxTail);
+                }
                 ++progress_count;
                 progress->emit(static_cast<double>(progress_count), tail);
                 last_progress_size = cur;
@@ -740,6 +760,7 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
         std::chrono::steady_clock::now() - start).count();
 
 
+    const auto cap_lines = static_cast<std::size_t>(capture_lines);
     nlohmann::json structured = {
         {"elapsed_ms", elapsed},
         {"timed_out", timed_out},
@@ -747,10 +768,10 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
         {"found_end", last_extract.found_end},
         {"julia_error", last_extract.julia_error},
         {"marker_id", marker.id},
-        {"stdout", last_extract.stdout_text},
-        {"value_repr", last_extract.value_repr},
-        {"error_message", last_extract.error_message},
-        {"backtrace", last_extract.backtrace},
+        {"stdout",        truncate_lines(last_extract.stdout_text,    cap_lines)},
+        {"value_repr",    truncate_lines(last_extract.value_repr,     cap_lines)},
+        {"error_message", truncate_lines(last_extract.error_message,  cap_lines)},
+        {"backtrace",     truncate_lines(last_extract.backtrace,      200)},
         {"transport", "tmux"},
     };
 

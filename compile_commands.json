@@ -1,0 +1,57 @@
+[
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/julia_wrap.cpp -o build/src/julia_wrap.o",
+    "file": "src/julia_wrap.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/log.cpp -o build/src/log.o",
+    "file": "src/log.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/main.cpp -o build/src/main.o",
+    "file": "src/main.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/mcp.cpp -o build/src/mcp.o",
+    "file": "src/mcp.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/process.cpp -o build/src/process.o",
+    "file": "src/process.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/progress.cpp -o build/src/progress.o",
+    "file": "src/progress.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/socket_client.cpp -o build/src/socket_client.o",
+    "file": "src/socket_client.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/state.cpp -o build/src/state.o",
+    "file": "src/state.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/tmux.cpp -o build/src/tmux.o",
+    "file": "src/tmux.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c src/tools.cpp -o build/src/tools.o",
+    "file": "src/tools.cpp"
+  },
+  {
+    "directory": "/home/johti17/Projects/JJMCP",
+    "command": "g++ -Isrc -std=c++23 -Wall -Wextra -Wpedantic -O2 -c tests/test_main.cpp -o build/tests/test_main.o",
+    "file": "tests/test_main.cpp"
+  }
+]
