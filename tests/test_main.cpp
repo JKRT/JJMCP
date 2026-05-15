@@ -38,12 +38,20 @@ void test_wrap_contains_markers_and_result_display()
     check(wrapped.find(marker.out_end) != std::string::npos, "wrapper contains out_end marker");
     check(wrapped.find(marker.val_end) != std::string::npos, "wrapper contains val_end marker");
     check(wrapped.find(marker.bt) != std::string::npos, "wrapper contains backtrace marker");
+    check(wrapped.rfind("(function ()\n", 0) == 0, "wrapper uses an immediately invoked function scope");
+    check(wrapped.find("function __jjmcp_eval_wrapper_abc()") != std::string::npos,
+          "wrapper gives the generated eval function an identifiable name");
+    check(wrapped.find("# JJMCP generated eval wrapper: visible in stack traces and pasted REPL code.") != std::string::npos,
+          "wrapper includes an identifying comment");
+    check(wrapped.find("return __jjmcp_eval_wrapper_abc()") != std::string::npos,
+          "wrapper invokes the named generated eval function");
     check(wrapped.find("__jjmcp_result = Base.include_string(Main, ") != std::string::npos,
           "wrapper includes user code in Main so assignments persist globally");
     check(wrapped.find("show(stdout, MIME(\"text/plain\"), __jjmcp_result)") != std::string::npos, "wrapper displays expression result");
     check(wrapped.find("showerror(stdout, __jjmcp_error)") != std::string::npos, "wrapper showerror without backtrace");
     check(wrapped.find("Base.show_backtrace(stdout, catch_backtrace())") != std::string::npos, "wrapper emits backtrace separately");
-    check(wrapped.find("nothing\nend\n") != std::string::npos, "wrapper suppresses REPL display of wrapper result");
+    check(wrapped.find("nothing\n    end\n    return __jjmcp_eval_wrapper_abc()\nend)()\n") != std::string::npos,
+          "wrapper suppresses REPL display of wrapper result");
 }
 
 void test_extract_between_markers()

@@ -48,6 +48,21 @@ std::size_t utf8_safe_suffix_start(const std::string& text, std::size_t start)
     return start;
 }
 
+std::string julia_identifier_suffix(const std::string& text)
+{
+    std::string out;
+    for (const unsigned char c : text) {
+        const bool ascii_alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+        const bool ascii_digit = c >= '0' && c <= '9';
+        if (ascii_alpha || ascii_digit || c == '_') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('_');
+        }
+    }
+    return out.empty() ? std::string("eval") : out;
+}
+
 } // namespace
 
 Marker make_marker(std::string id)
@@ -109,52 +124,59 @@ std::string wrap_julia_code(const std::string& code, const Marker& marker)
 {
     const std::string eval_source = code.empty() ? std::string("nothing") : code;
     const std::string eval_filename = "jjmcp_eval_" + marker.id;
+    const std::string wrapper_name = "__jjmcp_eval_wrapper_" + julia_identifier_suffix(marker.id);
 
     // Markers are emitted to stderr in dim grey via printstyled+flush so that they appear in the
     // pane scrollback distinct from the user's stdout output (which keeps default coloring).
     // tmux capture-pane -J -p captures both streams, so line-anchored extraction is unaffected.
     auto emit = [](const std::string& m) {
-        return "        printstyled(stderr, " + julia_string_literal(m)
+        return "            printstyled(stderr, " + julia_string_literal(m)
                + ", '\\n'; color=:light_black); flush(stderr)\n";
     };
     auto emit_inline = [](const std::string& m) {
-        return "    printstyled(stderr, " + julia_string_literal(m)
+        return "        printstyled(stderr, " + julia_string_literal(m)
                + ", '\\n'; color=:light_black); flush(stderr)\n";
     };
 
     std::string out;
-    out += "let\n";
-    out += "    local __jjmcp_result\n";
+    out += "(function ()\n";
+    out += "    # JJMCP generated scope: keeps the named wrapper local to this eval.\n";
+    out += "    function " + wrapper_name + "()\n";
+    out += "        # JJMCP generated eval wrapper: visible in stack traces and pasted REPL code.\n";
+    out += "        # User code still runs in Main via Base.include_string so globals persist.\n";
+    out += "        local __jjmcp_result\n";
     out += emit_inline(marker.begin);
-    out += "    try\n";
-    out += "        __jjmcp_result = Base.include_string(Main, "
+    out += "        try\n";
+    out += "            __jjmcp_result = Base.include_string(Main, "
            + julia_string_literal(eval_source) + ", "
            + julia_string_literal(eval_filename) + ")\n";
     out += emit(marker.out_end);
-    out += "        if !isnothing(__jjmcp_result)\n";
-    out += "            show(stdout, MIME(\"text/plain\"), __jjmcp_result)\n";
+    out += "            if !isnothing(__jjmcp_result)\n";
+    out += "                show(stdout, MIME(\"text/plain\"), __jjmcp_result)\n";
+    out += "                println()\n";
+    out += "                flush(stdout)\n";
+    out += "            end\n";
+    out += emit(marker.val_end);
+    out += "        catch e\n";
+    out += emit(marker.error);
+    out += "            local __jjmcp_error = e\n";
+    out += "            while __jjmcp_error isa LoadError\n";
+    out += "                __jjmcp_error = __jjmcp_error.error\n";
+    out += "            end\n";
+    out += "            showerror(stdout, __jjmcp_error)\n";
     out += "            println()\n";
     out += "            flush(stdout)\n";
-    out += "        end\n";
-    out += emit(marker.val_end);
-    out += "    catch e\n";
-    out += emit(marker.error);
-    out += "        local __jjmcp_error = e\n";
-    out += "        while __jjmcp_error isa LoadError\n";
-    out += "            __jjmcp_error = __jjmcp_error.error\n";
-    out += "        end\n";
-    out += "        showerror(stdout, __jjmcp_error)\n";
-    out += "        println()\n";
-    out += "        flush(stdout)\n";
     out += emit(marker.bt);
-    out += "        Base.show_backtrace(stdout, catch_backtrace())\n";
-    out += "        println()\n";
-    out += "        flush(stdout)\n";
-    out += "    finally\n";
+    out += "            Base.show_backtrace(stdout, catch_backtrace())\n";
+    out += "            println()\n";
+    out += "            flush(stdout)\n";
+    out += "        finally\n";
     out += emit(marker.end);
+    out += "        end\n";
+    out += "        nothing\n";
     out += "    end\n";
-    out += "    nothing\n";
-    out += "end\n";
+    out += "    return " + wrapper_name + "()\n";
+    out += "end)()\n";
     return out;
 }
 
