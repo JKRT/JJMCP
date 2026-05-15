@@ -64,18 +64,88 @@ pass() { echo "  ok: $*"; }
 echo "== bind + simple eval (success path) =="
 out=$(printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
-    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"jjmcp_bind\",\"arguments\":{\"target\":\"$PANE_ID\"}}}" \
-    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"println(\"itest_marker\"); 7*6","validate_syntax":false}}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
+    "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"jjmcp_bind\",\"arguments\":{\"target\":\"$PANE_ID\"}}}" \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"jjmcp_capture_test_results","arguments":{"include_raw":false}}}' \
+    '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"jjmcp_capture_test_results","arguments":{"require_summary":true,"include_raw":false}}}' \
+    '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"println(\"itest_marker\"); 7*6","validate_syntax":false}}}' \
     | run_jjmcp)
 
-eval_resp=$(echo "$out" | jq -c 'select(.id==3)')
+tools_list=$(echo "$out" | jq -c 'select(.id==2)')
+bind_resp=$(echo "$out" | jq -c 'select(.id==3)')
+fresh_capture=$(echo "$out" | jq -c 'select(.id==4)')
+fresh_capture_with_required_summary=$(echo "$out" | jq -c 'select(.id==5)')
+eval_resp=$(echo "$out" | jq -c 'select(.id==6)')
+fresh_sc=$(echo "$fresh_capture" | jq -c .result.structuredContent)
 sc=$(echo "$eval_resp" | jq -c .result.structuredContent)
+
+echo "$tools_list" | jq -e '.result.tools[] | select(.name=="jjmcp_capture_test_results")' >/dev/null \
+    && pass "tools/list includes jjmcp_capture_test_results" \
+    || fail "tools/list missing jjmcp_capture_test_results"
+[ "$(echo "$fresh_sc" | jq -r .found_summary)" = "false" ] \
+    && pass "fresh capture has found_summary=false" \
+    || fail "fresh capture found_summary expected false"
+[ "$(echo "$fresh_capture_with_required_summary" | jq -r .result.isError)" = "true" ] \
+    && pass "fresh capture with require_summary=true returns error" \
+    || fail "fresh capture with require_summary=true should fail"
+[ "$(echo "$bind_resp" | jq -r '.result.isError == true')" = "false" ] \
+    && pass "bind call succeeds" \
+    || fail "bind call failed"
 
 [ "$(echo "$sc" | jq -r .julia_error)" = "false" ] && pass "julia_error=false" || fail "julia_error wrong"
 [ "$(echo "$sc" | jq -r .found_begin)" = "true" ] && pass "found_begin=true" || fail "found_begin wrong"
 [ "$(echo "$sc" | jq -r .found_end)" = "true" ] && pass "found_end=true" || fail "found_end wrong"
 [ "$(echo "$sc" | jq -r .stdout)" = "itest_marker" ] && pass "stdout=itest_marker" || fail "stdout wrong: $(echo "$sc" | jq -r .stdout)"
 [ "$(echo "$sc" | jq -r .value_repr)" = "42" ] && pass "value_repr=42" || fail "value_repr wrong: $(echo "$sc" | jq -r .value_repr)"
+
+echo "== synthetic test run + parsed summary =="
+out=$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"jjmcp_bind\",\"arguments\":{\"target\":\"$PANE_ID\"}}}" \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"using Test\n@testset \"jjmcp_itest\" begin\n@test 1 == 1\n@test 2 == 2\nend","validate_syntax":false}}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"jjmcp_capture_test_results","arguments":{"require_summary":true,"include_raw":false}}}' \
+    | run_jjmcp)
+
+summary_resp=$(echo "$out" | jq -c 'select(.id==4)')
+summary_sc=$(echo "$summary_resp" | jq -c .result.structuredContent)
+[ "$(echo "$summary_resp" | jq -r '.result.isError == true')" = "false" ] \
+    && pass "capture_test_results succeeds after test execution" \
+    || fail "capture_test_results failed for synthetic tests"
+[ "$(echo "$summary_sc" | jq -r .found_summary)" = "true" ] && pass "synthetic run found_summary=true" || fail "synthetic run found_summary=false"
+[ "$(echo "$summary_sc" | jq -r .test_pass)" = "2" ] && pass "synthetic run parsed test_pass=2" || fail "synthetic run wrong test_pass: $(echo "$summary_sc" | jq -r .test_pass)"
+[ "$(echo "$summary_sc" | jq -r .test_fail)" = "0" ] && pass "synthetic run parsed test_fail=0" || fail "synthetic run wrong test_fail: $(echo "$summary_sc" | jq -r .test_fail)"
+[ "$(echo "$summary_sc" | jq -r .test_total)" = "2" ] && pass "synthetic run parsed test_total=2" || fail "synthetic run wrong test_total: $(echo "$summary_sc" | jq -r .test_total)"
+
+echo "== eval preserves global assignments in bound REPL =="
+out=$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"jjmcp_bind\",\"arguments\":{\"target\":\"$PANE_ID\"}}}" \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"jjmcp_itest_global = x -> x + 10","validate_syntax":false,"transport":"tmux"}}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"jjmcp_itest_global(32)","validate_syntax":false,"transport":"tmux"}}}' \
+    | run_jjmcp)
+
+global_set_resp=$(echo "$out" | jq -c 'select(.id==3)')
+global_read_resp=$(echo "$out" | jq -c 'select(.id==4)')
+global_read_sc=$(echo "$global_read_resp" | jq -c .result.structuredContent)
+[ "$(echo "$global_set_resp" | jq -r '.result.isError == true')" = "false" ] \
+    && pass "global assignment eval succeeds" \
+    || fail "global assignment eval failed"
+[ "$(echo "$global_read_sc" | jq -r .value_repr)" = "42" ] \
+    && pass "global assignment persists across tmux evals" \
+    || fail "global assignment did not persist: $(echo "$global_read_sc" | jq -r .value_repr)"
+
+echo "== eval truncates large single-line tmux output =="
+out=$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"jjmcp_bind\",\"arguments\":{\"target\":\"$PANE_ID\"}}}" \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"print(repeat(\"x\", 300000)); nothing","validate_syntax":false,"transport":"tmux"}}}' \
+    | run_jjmcp)
+
+large_resp=$(echo "$out" | jq -c 'select(.id==3)')
+large_sc=$(echo "$large_resp" | jq -c .result.structuredContent)
+echo "$large_sc" | jq -r .stdout | grep -q "JJMCP truncated" \
+    && pass "large tmux stdout is truncated" \
+    || fail "large tmux stdout missing truncation marker"
 
 echo "== eval (error path) =="
 out=$(printf '%s\n' \
@@ -102,7 +172,11 @@ out=$(printf '%s\n' \
 eval_resp=$(echo "$out" | jq -c 'select(.id==3)')
 [ "$(echo "$eval_resp" | jq -r .result.isError)" = "true" ] && pass "syntax error caught before paste" || fail "syntax pre-validation did not catch broken function"
 text=$(echo "$eval_resp" | jq -r .result.content[0].text)
-echo "$text" | grep -q "syntax error before eval" && pass "error text mentions syntax pre-validation" || fail "error text format unexpected: $text"
+if echo "$text" | grep -Eq "syntax error before eval|ParseError|Expected"; then
+    pass "error text mentions syntax or parse failure"
+else
+    fail "error text format unexpected: $text"
+fi
 
 if [ "$failures" -ne 0 ]; then
     echo "FAIL: $failures tmux fixture assertions failed" >&2

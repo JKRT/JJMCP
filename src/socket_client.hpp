@@ -3,6 +3,7 @@
 #include "result.hpp"
 
 #include <chrono>
+#include <cstddef>
 #include <nlohmann/json.hpp>
 #include <string>
 
@@ -19,7 +20,7 @@ struct SocketEvalResponse {
 };
 
 // Talks to JJMCPHelper.jl over a Unix domain socket. The helper runs eval at top level via
-// Base.eval(Main, ...) and echoes stdout/stderr back to the live REPL, so the human keeps the
+// Base.include_string(Main, ...) and echoes stdout/stderr back to the live REPL, so the human keeps the
 // shared-REPL property while the agent receives a structured copy here.
 class SocketClient {
 public:
@@ -34,7 +35,8 @@ public:
     // calls are bounded by `timeout` via SO_SNDTIMEO / SO_RCVTIMEO.
     Result<SocketEvalResponse> eval(const std::string& path,
                                     const std::string& code,
-                                    std::chrono::milliseconds timeout) const;
+                                    std::chrono::milliseconds timeout,
+                                    std::size_t max_output_bytes) const;
 };
 
 } // namespace jjmcp

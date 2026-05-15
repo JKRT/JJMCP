@@ -78,6 +78,43 @@ expected_stdout=$(printf 'sock_test\n')
 elapsed=$(echo "$sc" | jq -r .elapsed_ms)
 [ "$elapsed" -lt 500 ] && pass "elapsed_ms=$elapsed (under 500 ms)" || fail "elapsed_ms=$elapsed exceeds 500 ms"
 
+echo "== eval via transport=socket preserves top-level include semantics =="
+out=$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"jjmcp_bind\",\"arguments\":{\"target\":\"$PANE_ID\"}}}" \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"jjmcp_sock_global = x -> x + 10","validate_syntax":false,"transport":"socket"}}}' \
+    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"jjmcp_sock_global(32)","validate_syntax":false,"transport":"socket"}}}' \
+    '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"using Test\n@testset \"sock_itest\" begin\n@test 1 == 1\nend","validate_syntax":false,"transport":"socket"}}}' \
+    | run_jjmcp)
+
+global_set_resp=$(echo "$out" | jq -c 'select(.id==3)')
+global_read_resp=$(echo "$out" | jq -c 'select(.id==4)')
+macro_resp=$(echo "$out" | jq -c 'select(.id==5)')
+global_read_sc=$(echo "$global_read_resp" | jq -c .result.structuredContent)
+macro_sc=$(echo "$macro_resp" | jq -c .result.structuredContent)
+[ "$(echo "$global_set_resp" | jq -r '.result.isError == true')" = "false" ] \
+    && pass "socket global assignment eval succeeds" \
+    || fail "socket global assignment eval failed"
+[ "$(echo "$global_read_sc" | jq -r .value_repr)" = "42" ] \
+    && pass "socket global assignment persists across evals" \
+    || fail "socket global assignment did not persist: $(echo "$global_read_sc" | jq -r .value_repr)"
+echo "$macro_sc" | jq -r .stdout | grep -q "Test Summary:" \
+    && pass "socket include_string handles using + macro in one eval" \
+    || fail "socket macro eval did not emit Test Summary"
+
+echo "== eval via transport=socket truncates large output =="
+out=$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"jjmcp_bind\",\"arguments\":{\"target\":\"$PANE_ID\"}}}" \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"print(repeat(\"x\", 300000)); nothing","validate_syntax":false,"transport":"socket"}}}' \
+    | run_jjmcp)
+
+large_resp=$(echo "$out" | jq -c 'select(.id==3)')
+large_sc=$(echo "$large_resp" | jq -c .result.structuredContent)
+echo "$large_sc" | jq -r .stdout | grep -q "JJMCP truncated" \
+    && pass "large socket stdout is truncated" \
+    || fail "large socket stdout missing truncation marker"
+
 echo "== eval via transport=socket (error path) =="
 out=$(printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \

@@ -74,9 +74,9 @@ resources_list=$(echo "$out" | jq -c 'select(.id==4)')
     || fail "ping result wrong"
 
 tool_count=$(echo "$tools_list" | jq -r '.result.tools | length')
-[ "$tool_count" -ge 9 ] \
-    && pass "tools/list returns $tool_count tools (>=9)" \
-    || fail "tools/list returned $tool_count, expected >=9"
+[ "$tool_count" -ge 10 ] \
+    && pass "tools/list returns $tool_count tools (>=10)" \
+    || fail "tools/list returned $tool_count, expected >=10"
 
 # Verify jjmcp_eval has the expected schema fields.
 eval_tool=$(echo "$tools_list" | jq -c '.result.tools[] | select(.name=="jjmcp_eval")')
@@ -109,6 +109,23 @@ has_output=$(echo "$eval_tool" | jq -r 'has("outputSchema")')
 echo "$tools_list" | jq -e '.result.tools[] | select(.name=="jjmcp_pkg_status")' >/dev/null \
     && pass "jjmcp_pkg_status tool present" \
     || fail "jjmcp_pkg_status tool missing"
+
+echo "$tools_list" | jq -e '.result.tools[] | select(.name=="jjmcp_capture_test_results")' >/dev/null \
+    && pass "jjmcp_capture_test_results tool present" \
+    || fail "jjmcp_capture_test_results tool missing"
+
+capture_tool=$(echo "$tools_list" | jq -c '.result.tools[] | select(.name=="jjmcp_capture_test_results")')
+for field in lines require_summary include_raw; do
+    has=$(echo "$capture_tool" | jq -r ".inputSchema.properties | has(\"$field\")")
+    [ "$has" = "true" ] \
+        && pass "jjmcp_capture_test_results inputSchema has $field" \
+        || fail "jjmcp_capture_test_results inputSchema missing $field"
+done
+
+has_output=$(echo "$capture_tool" | jq -r 'has("outputSchema")')
+[ "$has_output" = "true" ] \
+    && pass "jjmcp_capture_test_results has outputSchema" \
+    || fail "jjmcp_capture_test_results missing outputSchema"
 
 # Resources list returns an array (empty when no project_root bound).
 resources_count=$(echo "$resources_list" | jq -r '.result.resources | length')

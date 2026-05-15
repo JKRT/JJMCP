@@ -35,7 +35,8 @@ bool SocketClient::socket_exists(const std::string& path)
 
 Result<SocketEvalResponse> SocketClient::eval(const std::string& path,
                                               const std::string& code,
-                                              std::chrono::milliseconds timeout) const
+                                              std::chrono::milliseconds timeout,
+                                              std::size_t max_output_bytes) const
 {
     const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -65,6 +66,7 @@ Result<SocketEvalResponse> SocketClient::eval(const std::string& path,
     nlohmann::json request = {
         {"op", "eval"},
         {"code", code},
+        {"max_output_bytes", max_output_bytes},
     };
     std::string payload = request.dump();
     payload.push_back('\n');

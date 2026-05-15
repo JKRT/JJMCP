@@ -35,7 +35,7 @@ end
     start(path = default_socket_path()) -> String
 
 Open a Unix socket at `path` and accept newline-delimited JSON requests from
-jjmcp. Each eval runs at top level via `Base.eval(Main, ...)`, so module loads
+jjmcp. Each eval runs at top level via `Base.include_string(Main, ...)`, so module loads
 and binding mutations land in the user's REPL just as if they had typed the
 code. Captured stdout / stderr are echoed back to the real terminal so the
 human still sees output; the value is also `display`ed. The structured copy
@@ -133,7 +133,8 @@ function _handle_request(line::AbstractString)
     end
     op = String(get(request, :op, ""))
     if op == "eval"
-        return _run_eval(String(get(request, :code, "")))
+        max_output_bytes = Int(get(request, :max_output_bytes, 262144))
+        return _run_eval(String(get(request, :code, "")), max_output_bytes)
     elseif op == "ping"
         return Dict("ok" => true, "pong" => true)
     elseif op == "pkg_status"
@@ -153,7 +154,30 @@ function _capture_pipe()
     return p
 end
 
-function _run_eval(code::AbstractString)
+function _unwrap_load_error(e)
+    while e isa LoadError
+        e = e.error
+    end
+    return e
+end
+
+function _truncate_bytes(text::AbstractString, max_bytes::Integer)
+    max_bytes <= 0 && return "[JJMCP truncated: output hidden because max byte count is 0]"
+    bytes = ncodeunits(text)
+    bytes <= max_bytes && return String(text)
+
+    keep = max_bytes
+    while keep > 0 && (codeunit(text, keep + 1) & 0xc0) == 0x80
+        keep -= 1
+    end
+    prefix = keep == 0 ? "" : String(codeunits(text)[1:keep])
+    if !isempty(prefix) && !endswith(prefix, "\n")
+        prefix *= "\n"
+    end
+    return prefix * "[JJMCP truncated: omitted $(bytes - keep) byte(s)]"
+end
+
+function _run_eval(code::AbstractString, max_output_bytes::Integer = 262144)
     # Julia's redirect_stdout requires a Pipe (or DevNull / Function), not a bare IOBuffer.
     # We pipe stdout/stderr to a background task that reads until the pipe is closed.
     out_pipe = _capture_pipe()
@@ -174,10 +198,10 @@ function _run_eval(code::AbstractString)
     redirect_stderr(err_pipe.in)
     t0 = time_ns()
     try
-        value = Base.eval(Main, Meta.parse("begin\n$code\nend"))
+        value = Base.include_string(Main, String(code), "jjmcp_socket_eval")
     catch e
         threw = true
-        err_msg = sprint(showerror, e)
+        err_msg = sprint(showerror, _unwrap_load_error(e))
         err_bt = sprint(Base.show_backtrace, catch_backtrace())
     finally
         elapsed_ns = time_ns() - t0
@@ -213,11 +237,11 @@ function _run_eval(code::AbstractString)
 
     return Dict(
         "ok" => !threw,
-        "stdout" => out_text,
-        "stderr" => err_text,
-        "value_show" => value_show,
-        "error_message" => err_msg,
-        "backtrace" => err_bt,
+        "stdout" => _truncate_bytes(out_text, max_output_bytes),
+        "stderr" => _truncate_bytes(err_text, max_output_bytes),
+        "value_show" => _truncate_bytes(value_show, max_output_bytes),
+        "error_message" => _truncate_bytes(err_msg, max_output_bytes),
+        "backtrace" => _truncate_bytes(err_bt, max_output_bytes),
         "elapsed_ms" => round(Int, elapsed_ns / 1_000_000),
     )
 end

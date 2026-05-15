@@ -13,6 +13,8 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <cctype>
+#include <regex>
 #include <sstream>
 #include <sys/stat.h>
 #include <thread>
@@ -24,6 +26,9 @@ namespace {
 constexpr int kDefaultTimeoutMs = 10000;
 constexpr int kDefaultCaptureLines = 2000;
 constexpr int kMaxCaptureLines = 50000;
+constexpr std::size_t kMaxMcpTextBytes = 256 * 1024;
+constexpr std::size_t kMaxMcpBacktraceBytes = 128 * 1024;
+constexpr std::size_t kMaxSocketFieldBytes = 240 * 1024;
 
 nlohmann::json object_schema(nlohmann::json properties, nlohmann::json required = nlohmann::json::array())
 {
@@ -78,6 +83,30 @@ nlohmann::json eval_output_schema()
     };
 }
 
+nlohmann::json test_summary_output_schema()
+{
+    return {
+        {"type", "object"},
+        {"properties",
+         {
+             {"found_summary", {"type", "boolean"}},
+             {"test_pass", {"type", "integer"}},
+             {"test_fail", {"type", "integer"}},
+             {"test_broken", {"type", "integer"}},
+             {"test_error", {"type", "integer"}},
+             {"test_total", {"type", "integer"}},
+             {"test_time", {"type", "string"}},
+             {
+                 "status",
+                 {{"type", "string"}, {"enum", nlohmann::json::array({"pass", "fail", "unknown"})}},
+             },
+             {"failures", {{"type", "array"}, {"items", {{"type", "string"}}}}},
+             {"raw_output", {"type", "string"}},
+             {"capture_lines", {"type", "integer"}},
+         }},
+    };
+}
+
 std::string require_string(const nlohmann::json& args, const char* key, std::string& error)
 {
     if (!args.contains(key) || !args[key].is_string()) {
@@ -104,6 +133,275 @@ int optional_int(const nlohmann::json& args, const char* key, int default_value,
         return default_value;
     }
     return std::clamp(args[key].get<int>(), min_value, max_value);
+}
+
+std::string truncate_tool_text(const std::string& text, std::size_t max_lines,
+                               std::size_t max_bytes = kMaxMcpTextBytes)
+{
+    return truncate_bytes(truncate_lines(text, max_lines), max_bytes);
+}
+
+std::string truncate_tool_tail(const std::string& text, std::size_t max_lines,
+                               std::size_t max_bytes = kMaxMcpTextBytes)
+{
+    return truncate_bytes_tail(truncate_lines_tail(text, max_lines), max_bytes);
+}
+
+std::string to_lower(std::string value)
+{
+    for (char& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+std::vector<std::string> summary_tokens(const std::string& text)
+{
+    std::string normalized;
+    normalized.reserve(text.size());
+    for (char c : text) {
+        normalized.push_back(c == '|' ? ' ' : c);
+    }
+    std::istringstream iss(normalized);
+    std::vector<std::string> tokens;
+    std::string token;
+    while (iss >> token) {
+        tokens.push_back(std::move(token));
+    }
+    return tokens;
+}
+
+bool is_int_token(const std::string& token)
+{
+    static const std::regex kInt{R"(^\d+$)"};
+    return std::regex_match(token, kInt);
+}
+
+bool is_float_token(const std::string& token)
+{
+    static const std::regex kFloat{R"(^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$)"};
+    return std::regex_match(token, kFloat);
+}
+
+std::vector<std::string> normalize_summary_columns(const std::string& summary_line)
+{
+    std::string tail = summary_line;
+    const auto marker_pos = tail.find("Test Summary:");
+    if (marker_pos != std::string::npos) {
+        tail = tail.substr(marker_pos + std::string("Test Summary:").size());
+    }
+    if (tail.empty()) {
+        return {};
+    }
+    const auto pipe_pos = tail.find('|');
+    if (pipe_pos != std::string::npos) {
+        tail = tail.substr(pipe_pos + 1);
+    }
+
+    std::vector<std::string> columns;
+    for (auto& token : summary_tokens(tail)) {
+        const auto name = to_lower(token);
+        if (name == "pass" || name == "passes") {
+            columns.push_back("pass");
+        } else if (name == "fail" || name == "fails") {
+            columns.push_back("fail");
+        } else if (name == "broken") {
+            columns.push_back("broken");
+        } else if (name == "error" || name == "errors") {
+            columns.push_back("error");
+        } else if (name == "total" || name == "tot") {
+            columns.push_back("total");
+        } else if (name == "time") {
+            columns.push_back("time");
+        }
+    }
+
+    if (columns.empty()) {
+        return {};
+    }
+    return columns;
+}
+
+bool parse_summary_counts_row(const std::vector<std::string>& columns, const std::string& line,
+                             TestSummaryResult& out)
+{
+    TestSummaryResult tmp;
+    bool parsed_pass = false;
+    bool parsed_fail = false;
+    bool parsed_broken = false;
+    bool parsed_error = false;
+    bool parsed_total = false;
+    bool parsed_any = false;
+
+    const auto tokens = summary_tokens(line);
+    if (tokens.empty()) {
+        return false;
+    }
+
+    std::size_t cursor = 0;
+    auto next_integer = [&]() -> int {
+        for (; cursor < tokens.size(); ++cursor) {
+            if (is_int_token(tokens[cursor])) {
+                return std::stoi(tokens[cursor++]);
+            }
+        }
+        return -1;
+    };
+
+    for (const auto& col : columns) {
+        if (col == "pass") {
+            const auto v = next_integer();
+            if (v < 0) return false;
+            tmp.test_pass = v;
+            parsed_pass = true;
+            parsed_any = true;
+        } else if (col == "fail") {
+            const auto v = next_integer();
+            if (v < 0) return false;
+            tmp.test_fail = v;
+            parsed_fail = true;
+            parsed_any = true;
+        } else if (col == "broken") {
+            const auto v = next_integer();
+            if (v < 0) return false;
+            tmp.test_broken = v;
+            parsed_broken = true;
+            parsed_any = true;
+        } else if (col == "error") {
+            const auto v = next_integer();
+            if (v < 0) return false;
+            tmp.test_error = v;
+            parsed_error = true;
+            parsed_any = true;
+        } else if (col == "total") {
+            const auto v = next_integer();
+            if (v < 0) return false;
+            tmp.test_total = v;
+            parsed_total = true;
+            parsed_any = true;
+        } else if (col == "time") {
+            if (cursor >= tokens.size()) {
+                return false;
+            }
+            tmp.test_time = tokens[cursor++];
+            if (cursor < tokens.size() && !is_int_token(tokens[cursor]) && !is_float_token(tokens[cursor])) {
+                tmp.test_time += " " + tokens[cursor++];
+            }
+        }
+    }
+
+    if (!parsed_any) {
+        return false;
+    }
+    if (!parsed_total && (parsed_pass || parsed_fail || parsed_broken || parsed_error)) {
+        tmp.test_total = tmp.test_pass + tmp.test_fail + tmp.test_broken + tmp.test_error;
+        parsed_total = true;
+    }
+
+    if (!parsed_total || !parsed_any) {
+        return false;
+    }
+
+    if (!parsed_fail && !parsed_broken && !parsed_error) {
+        tmp.status = "pass";
+    } else {
+        tmp.status = "fail";
+    }
+
+    tmp.found_summary = true;
+
+    out = std::move(tmp);
+    return true;
+}
+
+std::vector<std::string> extract_failure_snippets(const std::vector<std::string>& lines)
+{
+    static const std::string kMarker = "Test Failed at";
+    std::vector<std::string> failures;
+
+    for (std::size_t i = 0; i < lines.size(); ++i) {
+        if (lines[i].find(kMarker) == std::string::npos) {
+            continue;
+        }
+        const auto start = (i == 0) ? 0 : i - 1;
+        const auto end = std::min(i + 1, lines.size() > 0 ? lines.size() - 1 : 0);
+        std::string snippet;
+        for (std::size_t j = start; j <= end; ++j) {
+            const auto trimmed = trim_ascii(lines[j]);
+            if (trimmed.empty()) {
+                continue;
+            }
+            if (!snippet.empty()) {
+                snippet.push_back('\n');
+            }
+            snippet += trimmed;
+        }
+        if (!snippet.empty()) {
+            if (failures.empty() || failures.back() != snippet) {
+                failures.push_back(std::move(snippet));
+            }
+        }
+    }
+    return failures;
+}
+
+TestSummaryResult parse_test_summary_impl(const std::string& capture)
+{
+    TestSummaryResult result;
+    const auto lines = split_lines(capture);
+    result.failures = extract_failure_snippets(lines);
+
+    for (int i = static_cast<int>(lines.size()) - 1; i >= 0; --i) {
+        if (lines[i].find("Test Summary:") == std::string::npos) {
+            continue;
+        }
+        std::vector<std::vector<std::string>> candidates;
+        {
+            const auto cols = normalize_summary_columns(lines[i]);
+            if (!cols.empty()) {
+                candidates.push_back(cols);
+            }
+        }
+        if (i + 1 < static_cast<int>(lines.size())) {
+            const auto header_cols = normalize_summary_columns(lines[i + 1]);
+            if (!header_cols.empty()) {
+                candidates.push_back(header_cols);
+            }
+        }
+        if (candidates.empty()) {
+            candidates.push_back({"pass", "total", "time"});
+        }
+        for (int j = i + 1; j < static_cast<int>(lines.size()) && j < i + 12; ++j) {
+            const auto line = trim_ascii(lines[j]);
+            if (line.empty()) {
+                continue;
+            }
+            if (line.find("Test Summary:") != std::string::npos) {
+                break;
+            }
+            TestSummaryResult parsed;
+            bool ok = false;
+            for (const auto& cols : candidates) {
+                if (parse_summary_counts_row(cols, line, parsed)) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (ok) {
+                result.found_summary = parsed.found_summary;
+                result.test_pass = parsed.test_pass;
+                result.test_fail = parsed.test_fail;
+                result.test_broken = parsed.test_broken;
+                result.test_error = parsed.test_error;
+                result.test_total = parsed.test_total;
+                result.test_time = parsed.test_time;
+                result.status = parsed.status;
+                return result;
+            }
+        }
+    }
+
+    return result;
 }
 
 std::filesystem::path config_base_from_project(const std::filesystem::path& cwd, const std::string& project_root)
@@ -236,6 +534,11 @@ std::string format_pane_info(const PaneInfo& info)
 
 } // namespace
 
+TestSummaryResult parse_test_summary(const std::string& capture)
+{
+    return parse_test_summary_impl(capture);
+}
+
 ToolDispatcher::ToolDispatcher(ServerState& state, const Tmux& tmux, std::filesystem::path cwd)
     : state_(state), tmux_(tmux), cwd_(std::move(cwd))
 {
@@ -285,6 +588,27 @@ nlohmann::json ToolDispatcher::list_tools_json() const
         "jjmcp_capture",
         "Capture recent output from the bound tmux pane without sending input.",
         object_schema({{"lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", kMaxCaptureLines}}}})));
+
+    tools.push_back(tool_schema(
+        "jjmcp_capture_test_results",
+        "Capture recent tmux output and parse the latest Julia Test Summary block.",
+        object_schema(
+            {
+                {"lines",
+                 {{"type", "integer"},
+                  {"minimum", 1},
+                  {"maximum", kMaxCaptureLines},
+                  {"default", kDefaultCaptureLines}}},
+                {"require_summary", {{"type", "boolean"},
+                                   {"default", false},
+                                   {"description", "fail when true and no summary is present in captured output (default false)."}},
+                },
+                {"include_raw", {{"type", "boolean"},
+                                 {"default", true},
+                                 {"description", "return raw capture text in structuredContent (default true)."}},
+                },
+            }),
+        test_summary_output_schema()));
 
     tools.push_back(tool_schema(
         "jjmcp_interrupt",
@@ -358,6 +682,9 @@ ToolResult ToolDispatcher::call(const std::string& name, const nlohmann::json& a
     }
     if (name == "jjmcp_capture") {
         return capture(arguments);
+    }
+    if (name == "jjmcp_capture_test_results") {
+        return capture_test_results(arguments);
     }
     if (name == "jjmcp_interrupt") {
         return interrupt();
@@ -486,7 +813,80 @@ ToolResult ToolDispatcher::capture(const nlohmann::json& arguments) const
     if (!captured) {
         return ToolResult::error(captured.error());
     }
-    return ToolResult::success(truncate_lines_tail(captured.value(), static_cast<std::size_t>(lines)));
+    return ToolResult::success(truncate_tool_tail(captured.value(), static_cast<std::size_t>(lines)));
+}
+
+ToolResult ToolDispatcher::capture_test_results(const nlohmann::json& arguments)
+{
+    if (!state_.binding) {
+        return ToolResult::error("no tmux pane is bound; call jjmcp_bind first");
+    }
+
+    const int lines = optional_int(arguments, "lines", kDefaultCaptureLines, 1, kMaxCaptureLines);
+    const bool require_summary = arguments.value("require_summary", false);
+    const bool include_raw = arguments.value("include_raw", true);
+
+    const auto captured = tmux_.capture_pane(bound_target(), lines);
+    if (!captured) {
+        return ToolResult::error(captured.error());
+    }
+    const std::string raw = truncate_tool_tail(captured.value(), static_cast<std::size_t>(lines));
+    auto parsed = parse_test_summary(raw);
+    parsed.test_time = trim_ascii(parsed.test_time);
+
+    if (!parsed.found_summary) {
+        parsed.status = "unknown";
+    } else if (parsed.test_fail == 0 && parsed.test_broken == 0 && parsed.test_error == 0) {
+        parsed.status = "pass";
+    } else {
+        parsed.status = "fail";
+    }
+
+    nlohmann::json structured = {
+        {"found_summary", parsed.found_summary},
+        {"test_pass", parsed.test_pass},
+        {"test_fail", parsed.test_fail},
+        {"test_broken", parsed.test_broken},
+        {"test_error", parsed.test_error},
+        {"test_total", parsed.test_total},
+        {"test_time", parsed.test_time},
+        {"status", parsed.status},
+        {"failures", parsed.failures},
+        {"capture_lines", lines},
+    };
+    if (include_raw) {
+        structured["raw_output"] = raw;
+    }
+
+    if (!parsed.found_summary && require_summary) {
+        return ToolResult::error("no test summary found in captured tmux output")
+            .with_structured(std::move(structured));
+    }
+
+    std::string text;
+    if (include_raw) {
+        text = raw;
+    } else if (parsed.found_summary) {
+        std::ostringstream out;
+        out << "Test Summary: "
+            << "pass=" << parsed.test_pass << ", fail=" << parsed.test_fail
+            << ", broken=" << parsed.test_broken << ", error=" << parsed.test_error
+            << ", total=" << parsed.test_total;
+        if (!parsed.test_time.empty()) {
+            out << ", time=" << parsed.test_time;
+        }
+        text = out.str();
+        if (!parsed.failures.empty()) {
+            text += "\nfailures:";
+            for (const auto& failure : parsed.failures) {
+                text += "\n" + failure;
+            }
+        }
+    } else {
+        text = "No test summary found in captured output";
+    }
+
+    return ToolResult::success(std::move(text)).with_structured(std::move(structured));
 }
 
 ToolResult ToolDispatcher::interrupt() const
@@ -541,8 +941,14 @@ namespace {
 
 // Build a ToolResult that mirrors the structuredContent shape used by the tmux marker path so the
 // agent sees a uniform result regardless of which transport ran the eval.
-ToolResult socket_response_to_tool_result(const SocketEvalResponse& resp, const std::string& transport_name)
+ToolResult socket_response_to_tool_result(const SocketEvalResponse& resp, const std::string& transport_name,
+                                          int capture_lines)
 {
+    const auto cap_lines = static_cast<std::size_t>(capture_lines);
+    const std::string stdout_text = truncate_tool_text(resp.stdout_text, cap_lines);
+    const std::string value_show = truncate_tool_text(resp.value_show, cap_lines);
+    const std::string error_message = truncate_tool_text(resp.error_message, cap_lines);
+    const std::string backtrace = truncate_tool_text(resp.backtrace, 200, kMaxMcpBacktraceBytes);
     nlohmann::json structured = {
         {"elapsed_ms", resp.elapsed_ms},
         {"timed_out", false},
@@ -550,26 +956,28 @@ ToolResult socket_response_to_tool_result(const SocketEvalResponse& resp, const 
         {"found_end", true},
         {"julia_error", !resp.ok},
         {"marker_id", ""},
-        {"stdout", resp.stdout_text},
-        {"value_repr", resp.value_show},
-        {"error_message", resp.error_message},
-        {"backtrace", resp.backtrace},
+        {"stdout", stdout_text},
+        {"value_repr", value_show},
+        {"error_message", error_message},
+        {"backtrace", backtrace},
         {"transport", transport_name},
     };
     std::string text;
     if (resp.ok) {
-        text = resp.stdout_text;
-        if (!resp.value_show.empty()) {
+        text = stdout_text;
+        if (!value_show.empty()) {
             if (!text.empty() && text.back() != '\n') text.push_back('\n');
-            text += resp.value_show;
+            text += value_show;
         }
+        text = truncate_bytes(text, kMaxMcpTextBytes);
         return ToolResult::success(std::move(text)).with_structured(std::move(structured));
     }
-    text = resp.error_message;
-    if (!resp.backtrace.empty()) {
+    text = error_message;
+    if (!backtrace.empty()) {
         if (!text.empty() && text.back() != '\n') text.push_back('\n');
-        text += resp.backtrace;
+        text += backtrace;
     }
+    text = truncate_bytes(text, kMaxMcpTextBytes);
     return ToolResult::error(std::move(text)).with_structured(std::move(structured));
 }
 
@@ -594,8 +1002,8 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
 
     // Transport routing: when transport is "socket" or "auto" and a JJMCPHelper.jl socket exists
     // for the bound pane, prefer that path for structured returns and millisecond-scale latency.
-    // The socket path runs eval at top level via Base.eval(Main, ...) and echoes stdout/stderr to
-    // the live REPL, so the human-visible scrollback is unchanged. With transport=tmux we always
+    // The socket path runs eval at top level via Base.include_string(Main, ...) and echoes
+    // stdout/stderr to the live REPL, so the human-visible scrollback is unchanged. With transport=tmux we always
     // use the marker path. With transport=auto, a socket failure falls back to the marker path
     // with a warn log; with transport=socket, a failure is returned as-is.
     if (transport != "tmux" && state_.binding) {
@@ -603,9 +1011,10 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
         const std::string sock_path = SocketClient::default_socket_path(pane_id);
         if (SocketClient::socket_exists(sock_path)) {
             const SocketClient client;
-            const auto resp = client.eval(sock_path, code, std::chrono::milliseconds(timeout_ms));
+            const auto resp = client.eval(sock_path, code, std::chrono::milliseconds(timeout_ms),
+                                          kMaxSocketFieldBytes);
             if (resp) {
-                return socket_response_to_tool_result(resp.value(), "socket");
+                return socket_response_to_tool_result(resp.value(), "socket", capture_lines);
             }
             if (transport == "socket") {
                 return ToolResult::error("socket transport failed: " + resp.error());
@@ -768,15 +1177,15 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
         {"found_end", last_extract.found_end},
         {"julia_error", last_extract.julia_error},
         {"marker_id", marker.id},
-        {"stdout",        truncate_lines(last_extract.stdout_text,    cap_lines)},
-        {"value_repr",    truncate_lines(last_extract.value_repr,     cap_lines)},
-        {"error_message", truncate_lines(last_extract.error_message,  cap_lines)},
-        {"backtrace",     truncate_lines(last_extract.backtrace,      200)},
+        {"stdout",        truncate_tool_text(last_extract.stdout_text,    cap_lines)},
+        {"value_repr",    truncate_tool_text(last_extract.value_repr,     cap_lines)},
+        {"error_message", truncate_tool_text(last_extract.error_message,  cap_lines)},
+        {"backtrace",     truncate_tool_text(last_extract.backtrace,      200, kMaxMcpBacktraceBytes)},
         {"transport", "tmux"},
     };
 
     if (!timed_out) {
-        auto text = truncate_lines(last_extract.text, static_cast<std::size_t>(capture_lines));
+        auto text = truncate_tool_text(last_extract.text, static_cast<std::size_t>(capture_lines));
         ToolResult result = last_extract.julia_error ? ToolResult::error(std::move(text))
                                                      : ToolResult::success(std::move(text));
         return result.with_structured(std::move(structured));
@@ -786,10 +1195,10 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
     out << "Timed out after " << timeout_ms << " ms waiting for " << marker.end;
     if (last_extract.found_begin && !last_extract.text.empty()) {
         out << "\nPartial output between markers:\n";
-        out << truncate_lines(last_extract.text, static_cast<std::size_t>(capture_lines));
+        out << truncate_tool_text(last_extract.text, static_cast<std::size_t>(capture_lines));
     } else if (!last_capture.empty()) {
         out << "\nRecent pane output:\n";
-        out << truncate_lines_tail(last_capture, static_cast<std::size_t>(std::min(capture_lines, 200)));
+        out << truncate_tool_tail(last_capture, static_cast<std::size_t>(std::min(capture_lines, 200)));
     }
     return ToolResult::error(out.str()).with_structured(std::move(structured));
 }

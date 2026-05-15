@@ -53,6 +53,10 @@ and optional
 .B jjmcp_capture
 Capture recent pane output without sending input.
 .TP
+.B jjmcp_capture_test_results
+Capture pane output and parse the latest Julia `Test Summary:` block, returning pass/fail/total counts
+and a compact failures list.
+.TP
 .B jjmcp_interrupt
 Send Ctrl-C to the bound pane.
 .TP

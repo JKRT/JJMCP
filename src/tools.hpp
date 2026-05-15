@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <vector>
 
 namespace jjmcp {
 
@@ -28,6 +29,20 @@ struct ToolResult {
     }
 };
 
+struct TestSummaryResult {
+    bool found_summary = false;
+    int test_pass = 0;
+    int test_fail = 0;
+    int test_broken = 0;
+    int test_error = 0;
+    int test_total = 0;
+    std::string test_time;
+    std::string status = "unknown";
+    std::vector<std::string> failures;
+};
+
+TestSummaryResult parse_test_summary(const std::string& capture);
+
 class ToolDispatcher {
 public:
     ToolDispatcher(ServerState& state, const Tmux& tmux, std::filesystem::path cwd);
@@ -46,6 +61,7 @@ private:
     ToolResult list_tmux() const;
     ToolResult bind(const nlohmann::json& arguments);
     ToolResult status() const;
+    ToolResult capture_test_results(const nlohmann::json& arguments);
     ToolResult eval(const nlohmann::json& arguments);
     ToolResult capture(const nlohmann::json& arguments) const;
     ToolResult interrupt() const;

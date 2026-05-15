@@ -46,6 +46,8 @@ std::string make_test_code(const std::string& test_expr, const std::string& file
 ExtractedOutput extract_between_markers(const std::string& capture, const Marker& marker);
 std::string truncate_lines(const std::string& text, std::size_t max_lines);
 std::string truncate_lines_tail(const std::string& text, std::size_t max_lines);
+std::string truncate_bytes(const std::string& text, std::size_t max_bytes);
+std::string truncate_bytes_tail(const std::string& text, std::size_t max_bytes);
 std::vector<std::string> split_lines(const std::string& text);
 std::string trim_ascii(std::string text);
 

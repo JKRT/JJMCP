@@ -1,6 +1,7 @@
 #include "julia_wrap.hpp"
 #include "socket_client.hpp"
 #include "tmux.hpp"
+#include "tools.hpp"
 
 #include <cstdlib>
 
@@ -37,8 +38,10 @@ void test_wrap_contains_markers_and_result_display()
     check(wrapped.find(marker.out_end) != std::string::npos, "wrapper contains out_end marker");
     check(wrapped.find(marker.val_end) != std::string::npos, "wrapper contains val_end marker");
     check(wrapped.find(marker.bt) != std::string::npos, "wrapper contains backtrace marker");
+    check(wrapped.find("__jjmcp_result = Base.include_string(Main, ") != std::string::npos,
+          "wrapper includes user code in Main so assignments persist globally");
     check(wrapped.find("show(stdout, MIME(\"text/plain\"), __jjmcp_result)") != std::string::npos, "wrapper displays expression result");
-    check(wrapped.find("showerror(stdout, e)") != std::string::npos, "wrapper showerror without backtrace");
+    check(wrapped.find("showerror(stdout, __jjmcp_error)") != std::string::npos, "wrapper showerror without backtrace");
     check(wrapped.find("Base.show_backtrace(stdout, catch_backtrace())") != std::string::npos, "wrapper emits backtrace separately");
     check(wrapped.find("nothing\nend\n") != std::string::npos, "wrapper suppresses REPL display of wrapper result");
 }
@@ -116,6 +119,12 @@ void test_truncate_lines()
 
     const auto tail = jjmcp::truncate_lines_tail("a\nb\nc\nd", 2);
     check(tail == "[JJMCP truncated: omitted 2 earlier line(s)]\nc\nd", "truncate_lines_tail keeps newest lines");
+
+    const auto bytes = jjmcp::truncate_bytes("abcdef", 3);
+    check(bytes == "abc\n[JJMCP truncated: omitted 3 byte(s)]", "truncate_bytes caps long single lines");
+
+    const auto bytes_tail = jjmcp::truncate_bytes_tail("abcdef", 3);
+    check(bytes_tail == "[JJMCP truncated: omitted 3 earlier byte(s)]\ndef", "truncate_bytes_tail keeps newest bytes");
 }
 
 void test_tmux_argv()
@@ -141,6 +150,53 @@ void test_socket_default_path()
 
     check(!SocketClient::socket_exists("/tmp/jjmcp-this-path-does-not-exist.sock"),
           "socket_exists returns false for missing path");
+}
+
+void test_parse_test_summary_pass_only()
+{
+    const std::string capture =
+        "julia> using Test\n"
+        "Test Summary:\n"
+        "|      | Pass  Total  Time\n"
+        "|      |    2      2  0.42s\n";
+    const auto parsed = jjmcp::parse_test_summary(capture);
+    check(parsed.found_summary, "parse summary detects pass-only block");
+    check(parsed.test_pass == 2, "parsed pass count = 2");
+    check(parsed.test_fail == 0, "parsed fail count defaults to 0");
+    check(parsed.test_total == 2, "parsed total count = 2");
+    check(parsed.test_time == "0.42s", "parsed summary time");
+    check(parsed.status == "pass", "parsed status = pass");
+    check(parsed.failures.empty(), "no failure snippets for passing run");
+}
+
+void test_parse_test_summary_with_failure()
+{
+    const std::string capture =
+        "julia> using Test\n"
+        "Test Failed at /tmp/runtests.jl:12\n"
+        "Test Summary:\n"
+        "|      | Pass  Fail  Total  Time\n"
+        "|      |    1     1     2  0.01 s\n";
+    const auto parsed = jjmcp::parse_test_summary(capture);
+    check(parsed.found_summary, "parse summary detects failing block");
+    check(parsed.test_pass == 1, "parsed fail-case pass count");
+    check(parsed.test_fail == 1, "parsed fail-case fail count");
+    check(parsed.test_total == 2, "parsed fail-case total count");
+    check(parsed.status == "fail", "parsed status = fail");
+    check(parsed.failures.size() == 1, "one failure snippet captured");
+    check(parsed.failures[0].find("Test Failed at /tmp/runtests.jl:12") != std::string::npos,
+          "failure snippet includes failing location");
+}
+
+void test_parse_test_summary_malformed()
+{
+    const std::string capture =
+        "julia> println(\"hello\")\n"
+        "Test Summary:\n"
+        "No tests were run\n";
+    const auto parsed = jjmcp::parse_test_summary(capture);
+    check(!parsed.found_summary, "malformed summary does not mark found_summary");
+    check(parsed.status == "unknown", "malformed summary status remains unknown");
 }
 
 void test_make_test_code()
@@ -206,6 +262,9 @@ int main()
     test_compute_capture_overlap();
     test_make_test_code();
     test_socket_default_path();
+    test_parse_test_summary_pass_only();
+    test_parse_test_summary_with_failure();
+    test_parse_test_summary_malformed();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

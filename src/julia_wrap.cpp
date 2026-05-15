@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <cstring>
-#include <sstream>
 #include <unistd.h>
 
 namespace jjmcp {
@@ -21,20 +20,32 @@ std::string join_lines(const std::vector<std::string>& lines, std::size_t first,
     return out;
 }
 
-std::string indent_code(const std::string& code)
+bool is_utf8_continuation(unsigned char c)
 {
-    std::stringstream input(code);
-    std::string line;
-    std::string out;
-    while (std::getline(input, line)) {
-        out += "            ";
-        out += line;
-        out.push_back('\n');
+    return (c & 0xc0) == 0x80;
+}
+
+std::size_t utf8_safe_prefix_length(const std::string& text, std::size_t max_bytes)
+{
+    if (max_bytes >= text.size()) {
+        return text.size();
     }
-    if (!code.empty() && code.back() == '\n') {
-        return out;
+    std::size_t keep = max_bytes;
+    while (keep > 0 && is_utf8_continuation(static_cast<unsigned char>(text[keep]))) {
+        --keep;
     }
-    return out;
+    return keep;
+}
+
+std::size_t utf8_safe_suffix_start(const std::string& text, std::size_t start)
+{
+    if (start >= text.size()) {
+        return text.size();
+    }
+    while (start < text.size() && is_utf8_continuation(static_cast<unsigned char>(text[start]))) {
+        ++start;
+    }
+    return start;
 }
 
 } // namespace
@@ -96,6 +107,9 @@ std::string julia_string_literal(const std::string& text)
 
 std::string wrap_julia_code(const std::string& code, const Marker& marker)
 {
+    const std::string eval_source = code.empty() ? std::string("nothing") : code;
+    const std::string eval_filename = "jjmcp_eval_" + marker.id;
+
     // Markers are emitted to stderr in dim grey via printstyled+flush so that they appear in the
     // pane scrollback distinct from the user's stdout output (which keeps default coloring).
     // tmux capture-pane -J -p captures both streams, so line-anchored extraction is unaffected.
@@ -113,9 +127,9 @@ std::string wrap_julia_code(const std::string& code, const Marker& marker)
     out += "    local __jjmcp_result\n";
     out += emit_inline(marker.begin);
     out += "    try\n";
-    out += "        __jjmcp_result = begin\n";
-    out += indent_code(code.empty() ? "nothing" : code);
-    out += "        end\n";
+    out += "        __jjmcp_result = Base.include_string(Main, "
+           + julia_string_literal(eval_source) + ", "
+           + julia_string_literal(eval_filename) + ")\n";
     out += emit(marker.out_end);
     out += "        if !isnothing(__jjmcp_result)\n";
     out += "            show(stdout, MIME(\"text/plain\"), __jjmcp_result)\n";
@@ -125,7 +139,11 @@ std::string wrap_julia_code(const std::string& code, const Marker& marker)
     out += emit(marker.val_end);
     out += "    catch e\n";
     out += emit(marker.error);
-    out += "        showerror(stdout, e)\n";
+    out += "        local __jjmcp_error = e\n";
+    out += "        while __jjmcp_error isa LoadError\n";
+    out += "            __jjmcp_error = __jjmcp_error.error\n";
+    out += "        end\n";
+    out += "        showerror(stdout, __jjmcp_error)\n";
     out += "        println()\n";
     out += "        flush(stdout)\n";
     out += emit(marker.bt);
@@ -374,6 +392,38 @@ std::string truncate_lines_tail(const std::string& text, std::size_t max_lines)
     std::string out = "[JJMCP truncated: omitted " + std::to_string(omitted) + " earlier line(s)]\n";
     out += join_lines(lines, omitted, lines.size());
     return out;
+}
+
+std::string truncate_bytes(const std::string& text, std::size_t max_bytes)
+{
+    if (max_bytes == 0) {
+        return "[JJMCP truncated: output hidden because max byte count is 0]";
+    }
+    if (text.size() <= max_bytes) {
+        return text;
+    }
+
+    const std::size_t keep = utf8_safe_prefix_length(text, max_bytes);
+    std::string out = text.substr(0, keep);
+    if (!out.empty() && out.back() != '\n') {
+        out.push_back('\n');
+    }
+    out += "[JJMCP truncated: omitted " + std::to_string(text.size() - keep) + " byte(s)]";
+    return out;
+}
+
+std::string truncate_bytes_tail(const std::string& text, std::size_t max_bytes)
+{
+    if (max_bytes == 0) {
+        return "[JJMCP truncated: output hidden because max byte count is 0]";
+    }
+    if (text.size() <= max_bytes) {
+        return text;
+    }
+
+    const std::size_t start = utf8_safe_suffix_start(text, text.size() - max_bytes);
+    return "[JJMCP truncated: omitted " + std::to_string(start) + " earlier byte(s)]\n"
+        + text.substr(start);
 }
 
 } // namespace jjmcp

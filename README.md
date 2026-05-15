@@ -133,6 +133,10 @@ Bindings are stored in memory and persisted to `.jjmcp/config.json` under the su
 - `jjmcp_revise`: run `using Revise; Revise.revise()`.
 - `jjmcp_activate`: run `using Pkg; Pkg.activate(path)`.
 - `jjmcp_test`: run `test_expr`, include a test file, or run `Pkg.test()`.
+- `jjmcp_capture_test_results`: parse the latest Julia `Test Summary:` block from tmux output and return
+  structured fields like `found_summary`, `test_pass`, `test_fail`, `test_total`, `status`, and `failures`.
+- `require_summary` defaults to `false`; when set to `true`, missing summaries return a tool error. `include_raw`
+  defaults to `true` and includes captured pane output in `raw_output`.
 
 ## Notes
 
