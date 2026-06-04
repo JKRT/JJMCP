@@ -80,7 +80,8 @@ nlohmann::json make_jsonrpc_error(const nlohmann::json& id, int code, const std:
     };
 }
 
-std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request, ToolDispatcher& tools)
+std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request, ToolDispatcher& tools,
+                                                   std::mutex& stdout_mutex)
 {
     const auto id = request_id_or_null(request);
 
@@ -157,7 +158,7 @@ std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request
             && params["_meta"].contains("progressToken")) {
             progress_token = params["_meta"]["progressToken"];
         }
-        ProgressEmitter emitter(std::cout, std::move(progress_token));
+        ProgressEmitter emitter(std::cout, stdout_mutex, std::move(progress_token));
         const auto result = tools.call(params["name"], arguments, &emitter);
         return make_jsonrpc_result(id, tool_result_json(result));
     }

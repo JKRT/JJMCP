@@ -9,12 +9,12 @@ namespace jjmcp {
 
 // ProgressEmitter wraps the optional MCP progressToken from a request's params._meta.
 // When a token was supplied, emit() writes a `notifications/progress` JSON-RPC frame to the bound
-// output stream (typically stdout) under a mutex so concurrent emissions cannot interleave at the
-// byte level. When the token is null, emit() is a no-op so callers can hold a single reference and
-// not branch.
+// output stream (typically stdout) under the shared stdout mutex so progress frames cannot
+// interleave at the byte level with responses written by other threads. When the token is null,
+// emit() is a no-op so callers can hold a single reference and not branch.
 class ProgressEmitter {
 public:
-    ProgressEmitter(std::ostream& output, nlohmann::json token);
+    ProgressEmitter(std::ostream& output, std::mutex& output_mutex, nlohmann::json token);
 
     [[nodiscard]] bool active() const { return active_; }
     [[nodiscard]] const nlohmann::json& token() const { return token_; }
@@ -25,8 +25,8 @@ public:
 
 private:
     std::ostream& output_;
+    std::mutex& mutex_;
     nlohmann::json token_;
-    std::mutex mutex_;
     bool active_;
 };
 

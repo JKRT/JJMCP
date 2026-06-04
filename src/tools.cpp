@@ -420,12 +420,24 @@ std::filesystem::path config_base_from_project(const std::filesystem::path& cwd,
 // without executing anything. Returns the parser diagnostic text on failure. Bounded to 2 seconds
 // so a Julia start-up hang cannot stall the eval pipeline. The user must have julia on PATH; if
 // not, validation is skipped (we cannot know, so we trust the agent and the live REPL).
+//
+// Meta.parseall parses the code as a toplevel block, so multi-statement input (e.g. a function
+// definition followed by a call) is accepted; single-expression Meta.parse rejected it with
+// "extra token after end of expression". parseall does not raise: it embeds Expr(:error) or
+// Expr(:incomplete) nodes, so we walk the tree and report the first such node's ParseError.
 Result<void> validate_julia_syntax(const std::string& code)
 {
     RunSpec spec;
     spec.argv = {"julia", "--color=no", "-e",
-                 "try; Meta.parse(read(stdin, String); raise=true); print(\"ok\"); catch e; "
-                 "showerror(stderr, e); exit(1); end"};
+                 "function __jjmcp_prob(x); if x isa Expr; "
+                 "(x.head === :error || x.head === :incomplete) && return x; "
+                 "for a in x.args; r = __jjmcp_prob(a); r === nothing || return r; end; end; "
+                 "return nothing; end; "
+                 "ex = Meta.parseall(read(stdin, String); filename=\"jjmcp_eval\"); "
+                 "p = __jjmcp_prob(ex); "
+                 "if p === nothing; print(\"ok\"); else; "
+                 "a = isempty(p.args) ? string(p.head) : p.args[1]; "
+                 "a isa Exception ? showerror(stderr, a) : print(stderr, a); exit(1); end"};
     spec.stdin_data = code;
     spec.timeout = std::chrono::milliseconds(2000);
     const ProcessRunner runner;
@@ -578,7 +590,7 @@ nlohmann::json ToolDispatcher::list_tools_json() const
                 {"timeout_ms", {{"type", "integer"}, {"minimum", 1}, {"maximum", state_.max_timeout_ms}}},
                 {"capture_lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", kMaxCaptureLines}}},
                 {"force", {{"type", "boolean"}, {"description", "skip pane-mode pre-check (default false)"}}},
-                {"validate_syntax", {{"type", "boolean"}, {"description", "parse code via a 2s julia Meta.parse before paste (default true)"}}},
+                {"validate_syntax", {{"type", "boolean"}, {"description", "parse code via a 2s julia Meta.parseall before paste; accepts multi-statement input (default true)"}}},
                 {"transport", {{"type", "string"}, {"enum", nlohmann::json::array({"auto", "tmux", "socket"})}, {"description", "auto (default), tmux (force marker path), or socket (require JJMCPHelper.jl)"}}},
             },
             nlohmann::json::array({"code"})),

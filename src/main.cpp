@@ -4,11 +4,15 @@
 #include "tmux.hpp"
 #include "tools.hpp"
 
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 #include <nlohmann/json.hpp>
+#include <queue>
 #include <string>
+#include <thread>
 
 namespace {
 
@@ -80,16 +84,68 @@ int serve()
 
     ToolDispatcher tools(state, tmux, ec ? std::filesystem::path(".") : cwd);
 
+    // All stdout writes (final responses on either thread, plus progress frames emitted from inside
+    // a running tool call) serialize on this mutex so concurrent frames cannot interleave byte-wise.
+    std::mutex stdout_mutex;
+    const auto write_locked = [&stdout_mutex](const nlohmann::json& message) {
+        std::lock_guard<std::mutex> guard(stdout_mutex);
+        write_mcp_message(std::cout, message);
+    };
+
+    // Methods that touch ToolDispatcher run on a single worker thread so the dispatcher (and the one
+    // bound REPL behind it) is only ever driven by one thread, and so a long-running tool call never
+    // blocks the read loop. Transport-level methods (ping, initialize, notifications) are handled
+    // inline on the read thread, keeping keepalive responsive while the worker is busy.
+    const auto needs_worker = [](const std::string& method) {
+        return method == "tools/call" || method == "tools/list"
+            || method == "resources/list" || method == "resources/read";
+    };
+
+    std::queue<nlohmann::json> jobs;
+    std::mutex jobs_mutex;
+    std::condition_variable jobs_cv;
+    bool shutting_down = false;
+
+    std::thread worker([&]() {
+        for (;;) {
+            nlohmann::json request;
+            {
+                std::unique_lock<std::mutex> lock(jobs_mutex);
+                jobs_cv.wait(lock, [&]() { return shutting_down || !jobs.empty(); });
+                if (jobs.empty()) {
+                    return;  // woken only for shutdown with no work left
+                }
+                request = std::move(jobs.front());
+                jobs.pop();
+            }
+            const auto response = dispatch_mcp_request(request, tools, stdout_mutex);
+            if (response) {
+                write_locked(*response);
+            }
+        }
+    });
+
+    const auto stop_worker = [&]() {
+        {
+            std::lock_guard<std::mutex> lock(jobs_mutex);
+            shutting_down = true;
+        }
+        jobs_cv.notify_all();
+        worker.join();
+    };
+
     for (;;) {
         const auto message = read_mcp_message(std::cin);
         if (!message) {
-            write_mcp_message(std::cout, make_jsonrpc_error(nullptr, -32700, message.error()));
+            write_locked(make_jsonrpc_error(nullptr, -32700, message.error()));
             if (!std::cin) {
+                stop_worker();
                 return 1;
             }
             continue;
         }
         if (message.value().eof) {
+            stop_worker();
             return 0;
         }
 
@@ -97,13 +153,26 @@ int serve()
         try {
             request = nlohmann::json::parse(message.value().body);
         } catch (const std::exception& e) {
-            write_mcp_message(std::cout, make_jsonrpc_error(nullptr, -32700, std::string("Parse error: ") + e.what()));
+            write_locked(make_jsonrpc_error(nullptr, -32700, std::string("Parse error: ") + e.what()));
             continue;
         }
 
-        const auto response = dispatch_mcp_request(request, tools);
+        const std::string method =
+            request.is_object() && request.contains("method") && request["method"].is_string()
+                ? request["method"].get<std::string>()
+                : std::string();
+        if (needs_worker(method)) {
+            {
+                std::lock_guard<std::mutex> lock(jobs_mutex);
+                jobs.push(std::move(request));
+            }
+            jobs_cv.notify_one();
+            continue;
+        }
+
+        const auto response = dispatch_mcp_request(request, tools, stdout_mutex);
         if (response) {
-            write_mcp_message(std::cout, *response);
+            write_locked(*response);
         }
     }
 }

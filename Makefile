@@ -13,7 +13,7 @@ TEST_DIR := tests
 MAN_DIR := man
 
 CPPFLAGS += -I$(SRC_DIR)
-CXXFLAGS += -std=c++23 -Wall -Wextra -Wpedantic -O2
+CXXFLAGS += -std=c++23 -Wall -Wextra -Wpedantic -O2 -pthread
 LDLIBS +=
 
 JSON_CFLAGS := $(shell $(PKG_CONFIG) --cflags nlohmann_json 2>/dev/null)
