@@ -140,6 +140,23 @@ Bindings are stored in memory and persisted to `.jjmcp/config.json` under the su
 - `require_summary` defaults to `false`; when set to `true`, missing summaries return a tool error. `include_raw`
   defaults to `true` and includes captured pane output in `raw_output`.
 
+## Long Runs
+
+Eval-style tools accept `timeout_ms`; the default per-process ceiling is 600000 ms. To permit longer
+runs, start the server with a larger ceiling, for example:
+
+```sh
+JJMCP_TIMEOUT_MS_MAX=14400000 build/jjmcp serve
+```
+
+That example allows calls up to four hours when the client passes a matching `timeout_ms`.
+Oversized eval output is returned from the end of the captured output, with a truncation marker for
+omitted earlier lines or bytes. The full output remains visible in the bound tmux pane scrollback.
+
 ## Notes
 
 The server sends code by loading a tmux buffer and pasting it into the bound pane. Evaluation output is isolated by unique marker lines and returned as MCP text content. Julia exceptions are captured as tool errors with the Julia error text.
+
+## License
+
+JohnJuliaMCP is released under the MIT License. Copyright (c) 2026 John Tinnerholm. See [LICENSE](LICENSE) for the full text.

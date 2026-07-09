@@ -115,6 +115,24 @@ echo "$large_sc" | jq -r .stdout | grep -q "JJMCP truncated" \
     && pass "large socket stdout is truncated" \
     || fail "large socket stdout missing truncation marker"
 
+echo "== eval via transport=socket returns tail when output is line-truncated =="
+out=$(printf '%s\n' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"jjmcp_bind\",\"arguments\":{\"target\":\"$PANE_ID\"}}}" \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"jjmcp_eval","arguments":{"code":"for i in 1:5\n    println(\"socket_tail_line_$i\")\nend\nnothing","capture_lines":2,"validate_syntax":false,"transport":"socket"}}}' \
+    | run_jjmcp)
+
+tail_resp=$(echo "$out" | jq -c 'select(.id==3)')
+tail_sc=$(echo "$tail_resp" | jq -c .result.structuredContent)
+tail_stdout=$(echo "$tail_sc" | jq -r .stdout)
+if echo "$tail_stdout" | grep -q "socket_tail_line_5" \
+    && ! echo "$tail_stdout" | grep -q "socket_tail_line_1" \
+    && echo "$tail_stdout" | grep -q "earlier line"; then
+    pass "socket stdout truncation keeps newest lines"
+else
+    fail "socket stdout truncation did not keep newest lines: $tail_stdout"
+fi
+
 echo "== eval via transport=socket (error path) =="
 out=$(printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \

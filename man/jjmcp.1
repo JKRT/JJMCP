@@ -72,6 +72,19 @@ in the bound pane.
 .TP
 .B jjmcp_test
 Run focused Julia tests in the existing REPL context.
+.SH LONG RUNS
+Eval-style tools accept
+.B timeout_ms.
+The default per-process maximum is 600000 ms.
+Set
+.B JJMCP_TIMEOUT_MS_MAX
+before starting
+.B jjmcp serve
+to allow longer calls.
+.PP
+When eval output is larger than the MCP response budget, JJMCP returns the end of the captured output
+and includes a truncation marker for omitted earlier lines or bytes.
+The full output remains visible in the bound tmux pane scrollback.
 .SH EXAMPLES
 .nf
 tmux new-session -s julia

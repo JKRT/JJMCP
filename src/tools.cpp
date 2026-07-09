@@ -29,6 +29,8 @@ constexpr int kMaxCaptureLines = 50000;
 constexpr std::size_t kMaxMcpTextBytes = 256 * 1024;
 constexpr std::size_t kMaxMcpBacktraceBytes = 128 * 1024;
 constexpr std::size_t kMaxSocketFieldBytes = 240 * 1024;
+constexpr std::size_t kMaxEvalAccumulatorBytes = 1024 * 1024;
+constexpr std::size_t kEvalAccumulatorTailLines = 2000;
 
 nlohmann::json object_schema(nlohmann::json properties, nlohmann::json required = nlohmann::json::array())
 {
@@ -135,16 +137,56 @@ int optional_int(const nlohmann::json& args, const char* key, int default_value,
     return std::clamp(args[key].get<int>(), min_value, max_value);
 }
 
-std::string truncate_tool_text(const std::string& text, std::size_t max_lines,
-                               std::size_t max_bytes = kMaxMcpTextBytes)
-{
-    return truncate_bytes(truncate_lines(text, max_lines), max_bytes);
-}
-
 std::string truncate_tool_tail(const std::string& text, std::size_t max_lines,
                                std::size_t max_bytes = kMaxMcpTextBytes)
 {
     return truncate_bytes_tail(truncate_lines_tail(text, max_lines), max_bytes);
+}
+
+void append_line(std::string& out, const std::string& line)
+{
+    out += line;
+    out.push_back('\n');
+}
+
+void append_block(std::string& out, const std::string& text)
+{
+    if (text.empty()) {
+        return;
+    }
+    out += text;
+    if (out.back() != '\n') {
+        out.push_back('\n');
+    }
+}
+
+std::string compact_marker_accumulator(const ExtractedOutput& extracted, const Marker& marker,
+                                       bool saw_out_end, bool saw_val_end, bool saw_error,
+                                       bool saw_backtrace, bool saw_end)
+{
+    std::string out;
+    append_line(out, marker.begin);
+    append_block(out, truncate_tool_tail(extracted.stdout_text, kEvalAccumulatorTailLines));
+
+    if (saw_error) {
+        append_line(out, marker.error);
+        append_block(out, truncate_tool_tail(extracted.error_message, kEvalAccumulatorTailLines));
+        if (saw_backtrace) {
+            append_line(out, marker.bt);
+            append_block(out, truncate_tool_tail(extracted.backtrace, 200, kMaxMcpBacktraceBytes));
+        }
+    } else if (saw_out_end) {
+        append_line(out, marker.out_end);
+        append_block(out, truncate_tool_tail(extracted.value_repr, kEvalAccumulatorTailLines));
+        if (saw_val_end) {
+            append_line(out, marker.val_end);
+        }
+    }
+
+    if (saw_end) {
+        append_line(out, marker.end);
+    }
+    return out;
 }
 
 std::string to_lower(std::string value)
@@ -957,10 +999,10 @@ ToolResult socket_response_to_tool_result(const SocketEvalResponse& resp, const 
                                           int capture_lines)
 {
     const auto cap_lines = static_cast<std::size_t>(capture_lines);
-    const std::string stdout_text = truncate_tool_text(resp.stdout_text, cap_lines);
-    const std::string value_show = truncate_tool_text(resp.value_show, cap_lines);
-    const std::string error_message = truncate_tool_text(resp.error_message, cap_lines);
-    const std::string backtrace = truncate_tool_text(resp.backtrace, 200, kMaxMcpBacktraceBytes);
+    const std::string stdout_text = truncate_tool_tail(resp.stdout_text, cap_lines);
+    const std::string value_show = truncate_tool_tail(resp.value_show, cap_lines);
+    const std::string error_message = truncate_tool_tail(resp.error_message, cap_lines);
+    const std::string backtrace = truncate_tool_tail(resp.backtrace, 200, kMaxMcpBacktraceBytes);
     nlohmann::json structured = {
         {"elapsed_ms", resp.elapsed_ms},
         {"timed_out", false},
@@ -981,7 +1023,7 @@ ToolResult socket_response_to_tool_result(const SocketEvalResponse& resp, const 
             if (!text.empty() && text.back() != '\n') text.push_back('\n');
             text += value_show;
         }
-        text = truncate_bytes(text, kMaxMcpTextBytes);
+        text = truncate_bytes_tail(text, kMaxMcpTextBytes);
         return ToolResult::success(std::move(text)).with_structured(std::move(structured));
     }
     text = error_message;
@@ -989,11 +1031,89 @@ ToolResult socket_response_to_tool_result(const SocketEvalResponse& resp, const 
         if (!text.empty() && text.back() != '\n') text.push_back('\n');
         text += backtrace;
     }
-    text = truncate_bytes(text, kMaxMcpTextBytes);
+    text = truncate_bytes_tail(text, kMaxMcpTextBytes);
     return ToolResult::error(std::move(text)).with_structured(std::move(structured));
 }
 
 } // namespace
+
+Result<void> ToolDispatcher::ensure_jjmcp_runtime(const int timeout_ms)
+{
+    if (!state_.binding) {
+        return Result<void>::failure("no tmux pane is bound; call jjmcp_bind first");
+    }
+
+    const std::string pane_key = state_.binding->pane_id.empty() ? state_.binding->target : state_.binding->pane_id;
+    if (tmux_runtime_bootstrapped_.contains(pane_key)) {
+        return Result<void>::success();
+    }
+
+    const Marker marker = make_marker(make_marker_id(++state_.marker_sequence));
+    const std::string bootstrap = make_jjmcp_runtime_bootstrap_code(marker);
+    const std::string buffer_name = "jjmcp_bootstrap_" + marker.id;
+    const auto sent = tmux_.send_text(bound_target(), bootstrap, buffer_name);
+    if (!sent) {
+        return Result<void>::failure(sent.error());
+    }
+
+    const auto start = std::chrono::steady_clock::now();
+    const auto deadline = start + std::chrono::milliseconds(std::max(1000, std::min(timeout_ms, 30000)));
+    std::chrono::milliseconds backoff{50};
+    constexpr std::chrono::milliseconds kBackoffMax{500};
+    std::string accumulator;
+    std::string last_capture;
+    ExtractedOutput extracted;
+
+    while (true) {
+        const auto captured = tmux_.capture_pane(bound_target(), 2000);
+        if (!captured) {
+            return Result<void>::failure(captured.error());
+        }
+        const std::string& cap = captured.value();
+        if (accumulator.empty()) {
+            accumulator = cap;
+        } else if (cap != last_capture) {
+            const std::size_t overlap = compute_capture_overlap(last_capture, cap);
+            if (overlap < cap.size()) {
+                accumulator.append(cap, overlap, cap.size() - overlap);
+            }
+        }
+        last_capture = cap;
+
+        extracted = extract_between_markers(cap, marker);
+        if (!extracted.found_begin) {
+            extracted = extract_between_markers(accumulator, marker);
+        }
+        if (extracted.found_end) {
+            break;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            std::ostringstream out;
+            out << "Timed out while installing JJMCP Julia runtime before " << marker.end;
+            if (!last_capture.empty()) {
+                out << "\nRecent pane output:\n";
+                out << truncate_tool_tail(last_capture, 120);
+            }
+            return Result<void>::failure(out.str());
+        }
+        std::this_thread::sleep_for(std::min(backoff, std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+        backoff = std::min(backoff * 2, kBackoffMax);
+    }
+
+    if (extracted.julia_error) {
+        std::string text = extracted.error_message;
+        if (!extracted.backtrace.empty()) {
+            if (!text.empty() && text.back() != '\n') text.push_back('\n');
+            text += extracted.backtrace;
+        }
+        return Result<void>::failure("failed to install JJMCP Julia runtime:\n" + text);
+    }
+
+    tmux_runtime_bootstrapped_.insert(pane_key);
+    return Result<void>::success();
+}
 
 ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, int capture_lines,
                                      bool force, ProgressEmitter* progress_override,
@@ -1065,8 +1185,12 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
         return ToolResult::error(acquired.error());
     }
 
+    if (const auto runtime = ensure_jjmcp_runtime(timeout_ms); !runtime) {
+        return ToolResult::error(runtime.error());
+    }
+
     const Marker marker = make_marker(next_marker_id(state_));
-    const std::string wrapped = wrap_julia_code(code, marker);
+    const std::string wrapped = wrap_julia_code(code, marker, timeout_ms);
     const std::string buffer_name = "jjmcp_" + marker.id;
     const auto start = std::chrono::steady_clock::now();
     const auto sent = tmux_.send_text(bound_target(), wrapped, buffer_name);
@@ -1075,7 +1199,10 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
     }
 
     const auto deadline = start + std::chrono::milliseconds(timeout_ms);
-    const int poll_capture_lines = std::clamp(capture_lines + 500, 1000, kMaxCaptureLines);
+    // Fast single-line prints wrap into thousands of terminal rows and can push BEGIN out of a
+    // small capture window before the first post-send poll. Keep the polling window larger than
+    // the returned capture window; final MCP output is still capped separately below.
+    const int poll_capture_lines = std::clamp(capture_lines + 8000, 10000, kMaxCaptureLines);
 
     // Adaptive polling: start at 50 ms, double when no growth, reset on growth, cap at 1000 ms.
     // Replaces a fixed 75 ms loop that issued ~4000 capture-pane subprocesses per 5-min Pkg.test.
@@ -1162,6 +1289,19 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
             }
         }
 
+        if (!last_extract.found_end && last_extract.found_begin
+            && accumulator.size() > kMaxEvalAccumulatorBytes) {
+            const bool saw_out_end = accumulator.find(marker.out_end) != std::string::npos;
+            const bool saw_val_end = accumulator.find(marker.val_end) != std::string::npos;
+            const bool saw_error = accumulator.find(marker.error) != std::string::npos;
+            const bool saw_backtrace = accumulator.find(marker.bt) != std::string::npos;
+            const bool saw_end = accumulator.find(marker.end) != std::string::npos;
+            accumulator = compact_marker_accumulator(last_extract, marker, saw_out_end, saw_val_end,
+                                                     saw_error, saw_backtrace, saw_end);
+            last_extract = extract_between_markers(accumulator, marker);
+            last_progress_size = 0;
+        }
+
         if (last_extract.found_end) {
             break;
         }
@@ -1189,15 +1329,15 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
         {"found_end", last_extract.found_end},
         {"julia_error", last_extract.julia_error},
         {"marker_id", marker.id},
-        {"stdout",        truncate_tool_text(last_extract.stdout_text,    cap_lines)},
-        {"value_repr",    truncate_tool_text(last_extract.value_repr,     cap_lines)},
-        {"error_message", truncate_tool_text(last_extract.error_message,  cap_lines)},
-        {"backtrace",     truncate_tool_text(last_extract.backtrace,      200, kMaxMcpBacktraceBytes)},
+        {"stdout",        truncate_tool_tail(last_extract.stdout_text,    cap_lines)},
+        {"value_repr",    truncate_tool_tail(last_extract.value_repr,     cap_lines)},
+        {"error_message", truncate_tool_tail(last_extract.error_message,  cap_lines)},
+        {"backtrace",     truncate_tool_tail(last_extract.backtrace,      200, kMaxMcpBacktraceBytes)},
         {"transport", "tmux"},
     };
 
     if (!timed_out) {
-        auto text = truncate_tool_text(last_extract.text, static_cast<std::size_t>(capture_lines));
+        auto text = truncate_tool_tail(last_extract.text, static_cast<std::size_t>(capture_lines));
         ToolResult result = last_extract.julia_error ? ToolResult::error(std::move(text))
                                                      : ToolResult::success(std::move(text));
         return result.with_structured(std::move(structured));
@@ -1207,7 +1347,7 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
     out << "Timed out after " << timeout_ms << " ms waiting for " << marker.end;
     if (last_extract.found_begin && !last_extract.text.empty()) {
         out << "\nPartial output between markers:\n";
-        out << truncate_tool_text(last_extract.text, static_cast<std::size_t>(capture_lines));
+        out << truncate_tool_tail(last_extract.text, static_cast<std::size_t>(capture_lines));
     } else if (!last_capture.empty()) {
         out << "\nRecent pane output:\n";
         out << truncate_tool_tail(last_capture, static_cast<std::size_t>(std::min(capture_lines, 200)));

@@ -154,6 +154,60 @@ function _capture_pipe()
     return p
 end
 
+mutable struct TailByteBuffer
+    data::Vector{UInt8}
+    omitted_bytes::Int
+    max_bytes::Int
+end
+
+function _append_tail!(tail::TailByteBuffer, chunk::Vector{UInt8})
+    if tail.max_bytes <= 0
+        tail.omitted_bytes += length(chunk)
+        empty!(tail.data)
+        return
+    end
+
+    append!(tail.data, chunk)
+    length(tail.data) <= tail.max_bytes && return
+
+    start = length(tail.data) - tail.max_bytes + 1
+    while start <= length(tail.data) && (tail.data[start] & 0xc0) == 0x80
+        start += 1
+    end
+    tail.omitted_bytes += start - 1
+    tail.data = start > length(tail.data) ? UInt8[] : tail.data[start:end]
+end
+
+function _tail_string(tail::TailByteBuffer)
+    tail.max_bytes <= 0 && return "[JJMCP truncated: output hidden because max byte count is 0]"
+    text = isempty(tail.data) ? "" : String(tail.data)
+    tail.omitted_bytes == 0 && return text
+    return "[JJMCP truncated: omitted $(tail.omitted_bytes) earlier byte(s)]\n" * text
+end
+
+function _drain_pipe_tail(io, mirror, max_bytes::Integer)
+    tail = TailByteBuffer(UInt8[], 0, Int(max_bytes))
+    while true
+        chunk = try
+            readavailable(io)
+        catch
+            break
+        end
+        if isempty(chunk)
+            eof(io) && break
+            yield()
+            continue
+        end
+        _append_tail!(tail, chunk)
+        try
+            write(mirror, chunk)
+            flush(mirror)
+        catch
+        end
+    end
+    return _tail_string(tail)
+end
+
 function _unwrap_load_error(e)
     while e isa LoadError
         e = e.error
@@ -161,20 +215,17 @@ function _unwrap_load_error(e)
     return e
 end
 
-function _truncate_bytes(text::AbstractString, max_bytes::Integer)
+function _truncate_bytes_tail(text::AbstractString, max_bytes::Integer)
     max_bytes <= 0 && return "[JJMCP truncated: output hidden because max byte count is 0]"
     bytes = ncodeunits(text)
     bytes <= max_bytes && return String(text)
 
-    keep = max_bytes
-    while keep > 0 && (codeunit(text, keep + 1) & 0xc0) == 0x80
-        keep -= 1
+    start = bytes - max_bytes + 1
+    while start <= bytes && (codeunit(text, start) & 0xc0) == 0x80
+        start += 1
     end
-    prefix = keep == 0 ? "" : String(codeunits(text)[1:keep])
-    if !isempty(prefix) && !endswith(prefix, "\n")
-        prefix *= "\n"
-    end
-    return prefix * "[JJMCP truncated: omitted $(bytes - keep) byte(s)]"
+    suffix = start > bytes ? "" : String(codeunits(text)[start:bytes])
+    return "[JJMCP truncated: omitted $(start - 1) earlier byte(s)]\n" * suffix
 end
 
 function _run_eval(code::AbstractString, max_output_bytes::Integer = 262144)
@@ -183,8 +234,10 @@ function _run_eval(code::AbstractString, max_output_bytes::Integer = 262144)
     out_pipe = _capture_pipe()
     err_pipe = _capture_pipe()
 
-    out_task = @async read(out_pipe.out, String)
-    err_task = @async read(err_pipe.out, String)
+    original_stdout = stdout
+    original_stderr = stderr
+    out_task = @async _drain_pipe_tail(out_pipe.out, original_stdout, max_output_bytes)
+    err_task = @async _drain_pipe_tail(err_pipe.out, original_stderr, max_output_bytes)
 
     value = nothing
     err_msg = ""
@@ -192,8 +245,6 @@ function _run_eval(code::AbstractString, max_output_bytes::Integer = 262144)
     elapsed_ns::UInt64 = 0
     threw = false
 
-    original_stdout = stdout
-    original_stderr = stderr
     redirect_stdout(out_pipe.in)
     redirect_stderr(err_pipe.in)
     t0 = time_ns()
@@ -215,11 +266,6 @@ function _run_eval(code::AbstractString, max_output_bytes::Integer = 262144)
     out_text = fetch(out_task)
     err_text = fetch(err_task)
 
-    # Echo captured output back to the real REPL so the human still sees their println output and
-    # any warnings, plus the value (or the error). This is what preserves the shared-REPL property.
-    isempty(out_text) || print(stdout, out_text)
-    isempty(err_text) || print(stderr, err_text)
-
     value_show = ""
     if !threw && value !== nothing
         try
@@ -237,11 +283,11 @@ function _run_eval(code::AbstractString, max_output_bytes::Integer = 262144)
 
     return Dict(
         "ok" => !threw,
-        "stdout" => _truncate_bytes(out_text, max_output_bytes),
-        "stderr" => _truncate_bytes(err_text, max_output_bytes),
-        "value_show" => _truncate_bytes(value_show, max_output_bytes),
-        "error_message" => _truncate_bytes(err_msg, max_output_bytes),
-        "backtrace" => _truncate_bytes(err_bt, max_output_bytes),
+        "stdout" => out_text,
+        "stderr" => err_text,
+        "value_show" => _truncate_bytes_tail(value_show, max_output_bytes),
+        "error_message" => _truncate_bytes_tail(err_msg, max_output_bytes),
+        "backtrace" => _truncate_bytes_tail(err_bt, max_output_bytes),
         "elapsed_ms" => round(Int, elapsed_ns / 1_000_000),
     )
 end

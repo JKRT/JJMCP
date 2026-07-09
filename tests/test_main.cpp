@@ -24,34 +24,38 @@ void check(bool condition, const std::string& message)
 
 void test_julia_string_literal()
 {
-    const auto literal = jjmcp::julia_string_literal("a\"b\\c\n");
-    check(literal == "\"a\\\"b\\\\c\\n\"", "julia string literal escapes quotes, slash, newline");
+    const auto literal = jjmcp::julia_string_literal("a\"b\\c\n$x");
+    check(literal == "\"a\\\"b\\\\c\\n\\$x\"", "julia string literal escapes quotes, slash, newline, dollar");
 }
 
 void test_wrap_contains_markers_and_result_display()
 {
     const auto marker = jjmcp::make_marker("abc");
-    const auto wrapped = jjmcp::wrap_julia_code("1 + 1", marker);
-    check(wrapped.find(marker.begin) != std::string::npos, "wrapper contains begin marker");
-    check(wrapped.find(marker.end) != std::string::npos, "wrapper contains end marker");
-    check(wrapped.find(marker.error) != std::string::npos, "wrapper contains error marker");
-    check(wrapped.find(marker.out_end) != std::string::npos, "wrapper contains out_end marker");
-    check(wrapped.find(marker.val_end) != std::string::npos, "wrapper contains val_end marker");
-    check(wrapped.find(marker.bt) != std::string::npos, "wrapper contains backtrace marker");
-    check(wrapped.rfind("(function ()\n", 0) == 0, "wrapper uses an immediately invoked function scope");
-    check(wrapped.find("function __jjmcp_eval_wrapper_abc()") != std::string::npos,
-          "wrapper gives the generated eval function an identifiable name");
-    check(wrapped.find("# JJMCP generated eval wrapper: visible in stack traces and pasted REPL code.") != std::string::npos,
-          "wrapper includes an identifying comment");
-    check(wrapped.find("return __jjmcp_eval_wrapper_abc()") != std::string::npos,
-          "wrapper invokes the named generated eval function");
-    check(wrapped.find("__jjmcp_result = Base.include_string(Main, ") != std::string::npos,
-          "wrapper includes user code in Main so assignments persist globally");
-    check(wrapped.find("show(stdout, MIME(\"text/plain\"), __jjmcp_result)") != std::string::npos, "wrapper displays expression result");
-    check(wrapped.find("showerror(stdout, __jjmcp_error)") != std::string::npos, "wrapper showerror without backtrace");
-    check(wrapped.find("Base.show_backtrace(stdout, catch_backtrace())") != std::string::npos, "wrapper emits backtrace separately");
-    check(wrapped.find("nothing\n    end\n    return __jjmcp_eval_wrapper_abc()\nend)()\n") != std::string::npos,
-          "wrapper suppresses REPL display of wrapper result");
+    const auto bootstrap = jjmcp::make_jjmcp_runtime_bootstrap_code(marker);
+    check(bootstrap.find(marker.begin) != std::string::npos, "bootstrap contains begin marker");
+    check(bootstrap.find(marker.end) != std::string::npos, "bootstrap contains end marker");
+    check(bootstrap.find(marker.error) != std::string::npos, "bootstrap contains error marker");
+    check(bootstrap.find(marker.out_end) != std::string::npos, "bootstrap contains out_end marker");
+    check(bootstrap.find(marker.val_end) != std::string::npos, "bootstrap contains val_end marker");
+    check(bootstrap.find(marker.bt) != std::string::npos, "bootstrap contains backtrace marker");
+    check(bootstrap.find("module JJMCPRuntime") != std::string::npos,
+          "bootstrap defines the Julia runtime module");
+    check(bootstrap.find("macro JJMCP_COMMAND(marker_id, timeout_ms, body)") != std::string::npos,
+          "bootstrap defines the command macro");
+    check(bootstrap.find("Core.eval(mod, stmt)") != std::string::npos,
+          "bootstrap evals top-level body statements in the caller module");
+    check(bootstrap.find("show(stdout, MIME(\"text/plain\"), result)") != std::string::npos,
+          "bootstrap runtime displays expression result");
+    check(bootstrap.find("showerror(stdout, err)") != std::string::npos,
+          "bootstrap runtime showerror without backtrace");
+    check(bootstrap.find("Base.show_backtrace(stdout, catch_backtrace())") != std::string::npos,
+          "bootstrap runtime emits backtrace separately");
+
+    const auto wrapped = jjmcp::wrap_julia_code("1 + 1", marker, 30000);
+    check(wrapped.rfind("@JJMCP_COMMAND \"abc\" 30000 begin\n", 0) == 0,
+          "wrapper is a clean macro command with timeout");
+    check(wrapped.find("1 + 1\nend\n") != std::string::npos,
+          "wrapper keeps the user code readable inside the macro body");
 }
 
 void test_extract_between_markers()
@@ -93,6 +97,25 @@ void test_extract_structured_success()
     check(e.value_repr == "42", "structured success: value repr");
     check(e.error_message.empty() && e.backtrace.empty(), "structured success: no error fields populated");
     check(e.text == "user printed line A\nuser printed line B\n42", "structured success: legacy text preserved");
+}
+
+void test_extract_structured_success_with_glued_marker()
+{
+    const auto marker = jjmcp::make_marker("glued");
+    const std::string capture =
+        "julia> print(\"the marker literal in pasted code should not count: __JJMCP_BEGIN_glued__\")\n"
+        "__JJMCP_BEGIN_glued__\n"
+        "unterminated stdout"
+        "__JJMCP_OUT_END_glued__\n"
+        "__JJMCP_VAL_END_glued__\n"
+        "__JJMCP_END_glued__\n";
+
+    const auto e = jjmcp::extract_between_markers(capture, marker);
+    check(e.found_begin && e.found_end, "structured glued marker: begin and end found");
+    check(!e.julia_error, "structured glued marker: no error flag");
+    check(e.stdout_text == "unterminated stdout", "structured glued marker: stdout before marker kept");
+    check(e.value_repr.empty(), "structured glued marker: empty value repr");
+    check(e.text == "unterminated stdout", "structured glued marker: legacy text kept");
 }
 
 void test_extract_structured_error()
@@ -264,6 +287,7 @@ int main()
     test_wrap_contains_markers_and_result_display();
     test_extract_between_markers();
     test_extract_structured_success();
+    test_extract_structured_success_with_glued_marker();
     test_extract_structured_error();
     test_truncate_lines();
     test_tmux_argv();

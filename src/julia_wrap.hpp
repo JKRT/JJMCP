@@ -36,7 +36,8 @@ struct ExtractedOutput {
 Marker make_marker(std::string id);
 std::string make_marker_id(unsigned long long sequence);
 std::string julia_string_literal(const std::string& text);
-std::string wrap_julia_code(const std::string& code, const Marker& marker);
+std::string make_jjmcp_runtime_bootstrap_code(const Marker& marker);
+std::string wrap_julia_code(const std::string& code, const Marker& marker, int timeout_ms);
 std::string make_activate_code(const std::string& path);
 std::string make_revise_code();
 // Build the test-driver Julia expression. Precedence: test_expr > file > test_item_pattern > Pkg.test().

@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace jjmcp {
@@ -73,6 +74,7 @@ private:
     ToolResult eval_code(const std::string& code, int timeout_ms, int capture_lines,
                          bool force = false, ProgressEmitter* progress = nullptr,
                          const std::string& transport = "auto");
+    Result<void> ensure_jjmcp_runtime(const int timeout_ms);
     std::string bound_target() const;
 
     ServerState& state_;
@@ -81,6 +83,7 @@ private:
     // Set by call() for the duration of one tool dispatch and read by eval_code() to emit
     // progress notifications. Null if the client did not pass a progressToken.
     ProgressEmitter* current_progress_ = nullptr;
+    std::unordered_set<std::string> tmux_runtime_bootstrapped_;
 };
 
 } // namespace jjmcp
