@@ -124,17 +124,75 @@ From an MCP client:
 
 Bindings are stored in memory and persisted to `.jjmcp/config.json` under the supplied `project_root`, or under the server current directory if no project root is supplied.
 
+## Visible Julia Commands
+
+Eval-style tools sent through the tmux transport are pasted as clean Julia macro calls after a
+one-time `JJMCPRuntime` bootstrap in the bound REPL. The bootstrap defines `@JJMCP_COMMAND`; later
+commands are visible and reusable instead of being large generated wrapper functions.
+
+For example, `jjmcp_eval` with `{"code":"x = 41\nx + 1","timeout_ms":10000}` appears in the REPL as:
+
+```julia
+@JJMCP_COMMAND "<marker-id>" 10000 begin
+x = 41
+x + 1
+end
+```
+
+The same macro path is used by all eval-style tmux tools:
+
+```julia
+@JJMCP_COMMAND "<marker-id>" 10000 begin
+try
+    using Revise
+    Revise.revise()
+    println("Revise complete")
+catch e
+    showerror(stdout, e, catch_backtrace())
+    println()
+end
+end
+```
+
+```julia
+@JJMCP_COMMAND "<marker-id>" 10000 begin
+using Pkg
+Pkg.activate("/path/to/project")
+end
+```
+
+```julia
+@JJMCP_COMMAND "<marker-id>" 120000 begin
+using Pkg
+Pkg.test()
+end
+```
+
+```julia
+@JJMCP_COMMAND "<marker-id>" 10000 begin
+using Pkg
+Pkg.status()
+end
+```
+
+Inside the macro, JJMCP still emits the same private begin/end/error/value markers used for MCP
+response extraction. User statements are evaluated in the caller module so globals, imports, package
+state, and Revise state remain part of the bound Julia session. Non-eval MCP tools such as
+`jjmcp_bind`, `jjmcp_status`, `jjmcp_capture`, and `jjmcp_interrupt` do not paste Julia code and
+therefore do not appear as `@JJMCP_COMMAND` calls.
+
 ## Tools
 
 - `jjmcp_list_tmux`: list sessions, windows, panes, pane ids, process names, titles, and paths.
 - `jjmcp_bind`: bind to an existing tmux pane.
 - `jjmcp_status`: report binding and pane liveness.
-- `jjmcp_eval`: evaluate Julia code in the bound pane using unique begin/end markers.
+- `jjmcp_eval`: evaluate Julia code in the bound pane using `@JJMCP_COMMAND`.
 - `jjmcp_capture`: capture recent output without sending input.
 - `jjmcp_interrupt`: send Ctrl-C to the bound pane.
-- `jjmcp_revise`: run `using Revise; Revise.revise()`.
-- `jjmcp_activate`: run `using Pkg; Pkg.activate(path)`.
-- `jjmcp_test`: run `test_expr`, include a test file, or run `Pkg.test()`.
+- `jjmcp_revise`: run `using Revise; Revise.revise()` through `@JJMCP_COMMAND`.
+- `jjmcp_activate`: run `using Pkg; Pkg.activate(path)` through `@JJMCP_COMMAND`.
+- `jjmcp_test`: run `test_expr`, include a test file, or run `Pkg.test()` through `@JJMCP_COMMAND`.
+- `jjmcp_pkg_status`: run `using Pkg; Pkg.status()` through `@JJMCP_COMMAND`.
 - `jjmcp_capture_test_results`: parse the latest Julia `Test Summary:` block from tmux output and return
   structured fields like `found_summary`, `test_pass`, `test_fail`, `test_total`, `status`, and `failures`.
 - `require_summary` defaults to `false`; when set to `true`, missing summaries return a tool error. `include_raw`
@@ -155,7 +213,9 @@ omitted earlier lines or bytes. The full output remains visible in the bound tmu
 
 ## Notes
 
-The server sends code by loading a tmux buffer and pasting it into the bound pane. Evaluation output is isolated by unique marker lines and returned as MCP text content. Julia exceptions are captured as tool errors with the Julia error text.
+The server sends code by loading a tmux buffer and pasting it into the bound pane. Evaluation output
+is isolated by marker lines emitted inside `@JJMCP_COMMAND` and returned as MCP text content. Julia
+exceptions are captured as tool errors with the Julia error text.
 
 ## License
 

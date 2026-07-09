@@ -19,4 +19,11 @@ Imperative shell:
 
 The server intentionally sends work into the user's existing tmux Julia REPL instead of creating hidden Julia workers. This keeps package state, Revise state, loaded modules, active project, and user-visible output aligned with the workflow the user already controls.
 
+For tmux eval transport, JJMCP installs a small `Main.JJMCPRuntime` helper module in the bound REPL
+and then pastes eval-style work as `@JJMCP_COMMAND "<marker-id>" <timeout_ms> begin ... end`.
+`jjmcp_eval`, `jjmcp_revise`, `jjmcp_activate`, `jjmcp_test`, and `jjmcp_pkg_status` all share this
+path. The macro emits the private markers used for MCP extraction and evaluates user statements in
+the caller module so globals and imports persist in the same REPL session. Non-eval tools only call
+tmux or inspect state and do not paste Julia code.
+
 Errors from malformed JSON-RPC requests are protocol errors. Errors from tmux or Julia execution are returned as MCP tool results with `isError: true`, so the server remains alive and the caller can inspect the text.

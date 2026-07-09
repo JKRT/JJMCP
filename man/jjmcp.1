@@ -49,6 +49,9 @@ optional
 .B timeout_ms,
 and optional
 .B capture_lines.
+When using the tmux transport, eval-style tools are pasted as
+.B @JJMCP_COMMAND
+macro calls after a one-time runtime bootstrap in the Julia REPL.
 .TP
 .B jjmcp_capture
 Capture recent pane output without sending input.
