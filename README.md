@@ -1,8 +1,9 @@
 # JohnJuliaMCP (JJMCP)
 
-JohnJuliaMCP is a local C++23 stdio MCP server for working through an existing tmux-based Julia REPL workflow. It binds to a tmux pane selected by the user, sends Julia code into that pane, and treats the visible REPL as the source of truth.
+JJMCP is a local C++23 stdio MCP server for working through an existing tmux-based Julia REPL workflow. It binds to a tmux pane selected by the user, sends Julia code into that pane, and treats the visible REPL as the source of truth.
 JJMCP does not spawn hidden Julia workers by default! The goal of this project is to provide a useable yet simple mcp server for AI agents when working on Julia development while at the same time keeping it simple enough such that a human can clearly see what is going on.
-It is designed to work in tmux session together with a revise based Julia workflow.
+
+JJMCP is designed to work in tmux session together with a revise based Julia workflow for Julia power users who are running several active Julia processes together with local or cloud based AI agents.
 
 The goal of this project is to support Unix systems such as macOS and Linux or Windows if the user works inside WSL.
 
@@ -219,4 +220,4 @@ exceptions are captured as tool errors with the Julia error text.
 
 ## License
 
-JohnJuliaMCP is released under the MIT License. Copyright (c) 2026 John Tinnerholm. See [LICENSE](LICENSE) for the full text.
+JJMCP is released under the MIT License. Copyright (c) 2026 John Tinnerholm. See [LICENSE](LICENSE) for the full text.
