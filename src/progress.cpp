@@ -1,5 +1,7 @@
 #include "progress.hpp"
 
+#include "mcp.hpp"
+
 #include <ostream>
 #include <utility>
 
@@ -29,7 +31,7 @@ void ProgressEmitter::emit(double progress, const std::string& message, double t
         {"method", "notifications/progress"},
         {"params", std::move(params)},
     };
-    output_ << frame.dump() << '\n';
+    output_ << encode_mcp_frame(frame) << '\n';
     output_.flush();
 }
 

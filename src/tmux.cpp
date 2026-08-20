@@ -105,7 +105,7 @@ Result<std::string> Tmux::list_all() const
 
 Result<PaneInfo> Tmux::pane_info(const std::string& target) const
 {
-    const std::string fmt = "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{pane_title}\t#{pane_active}\t#{pane_dead}\t#{pane_current_path}";
+    const std::string fmt = "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_current_command}\t#{pane_title}\t#{pane_active}\t#{pane_dead}\t#{pane_current_path}\t#{pane_pid}";
     const auto result = run_tmux({"display-message", "-p", "-t", target, fmt});
     if (!result) {
         return Result<PaneInfo>::failure(result.error());
@@ -129,6 +129,9 @@ Result<PaneInfo> Tmux::pane_info(const std::string& target) const
     info.active = fields[6];
     info.dead = fields[7];
     info.current_path = fields[8];
+    if (fields.size() > 9) {
+        info.pane_pid = fields[9];
+    }
     return Result<PaneInfo>::success(std::move(info));
 }
 

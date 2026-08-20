@@ -83,6 +83,7 @@ test-integration: $(BUILD_DIR)/jjmcp
 	fi
 	@./tests/integration/test_mcp_conformance.sh
 	@./tests/integration/test_tmux_fixture.sh
+	@./tests/integration/test_repl_restart.sh
 	@./tests/integration/test_socket_fixture.sh
 
 install: $(BUILD_DIR)/jjmcp

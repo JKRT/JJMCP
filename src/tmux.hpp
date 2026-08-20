@@ -19,6 +19,8 @@ struct PaneInfo {
     std::string active;
     std::string dead;
     std::string current_path;
+    // Pid of the process tmux started in the pane (usually the shell, not the REPL).
+    std::string pane_pid;
 
     [[nodiscard]] bool alive() const { return dead != "1" && !pane_id.empty(); }
 };

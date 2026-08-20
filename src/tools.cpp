@@ -10,10 +10,12 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
 #include <cctype>
+#include <optional>
 #include <regex>
 #include <sstream>
 #include <sys/stat.h>
@@ -284,7 +286,9 @@ bool parse_summary_counts_row(const std::vector<std::string>& columns, const std
     auto next_integer = [&]() -> int {
         for (; cursor < tokens.size(); ++cursor) {
             if (is_int_token(tokens[cursor])) {
-                return std::stoi(tokens[cursor++]);
+                // Pane text is arbitrary, so a digit run can exceed int; clamp instead of throwing.
+                const long long parsed = std::strtoll(tokens[cursor++].c_str(), nullptr, 10);
+                return static_cast<int>(std::clamp<long long>(parsed, 0, 1000000000));
             }
         }
         return -1;
@@ -790,6 +794,10 @@ ToolResult ToolDispatcher::bind(const nlohmann::json& arguments)
     binding.project_root = project_root;
     binding.bound_at = timestamp_now();
 
+    // Binding is the natural re-sync point: forget any earlier runtime injection for this pane so
+    // the next eval installs Main.JJMCPRuntime again, whatever process now owns the pane.
+    tmux_runtime_bootstrapped_.invalidate(binding.pane_id.empty() ? binding.target : binding.pane_id);
+
     const auto config_base = config_base_from_project(cwd_, project_root);
     set_binding(state_, std::move(binding), config_base);
     const auto saved = save_config(state_);
@@ -1035,16 +1043,84 @@ ToolResult socket_response_to_tool_result(const SocketEvalResponse& resp, const 
     return ToolResult::error(std::move(text)).with_structured(std::move(structured));
 }
 
+// The REPL rejects the pasted wrapper with an UndefVarError when Main.JJMCPRuntime is gone, which
+// happens when the Julia process in the pane exited and a new one took its place. Scan only after
+// the echo of this eval's marker id, so an older failure in the scrollback cannot trigger a rerun.
+bool jjmcp_runtime_missing(const std::string& capture, const std::string& marker_id)
+{
+    const auto echo = capture.rfind(marker_id);
+    if (echo == std::string::npos) {
+        return false;
+    }
+    const auto error_pos = capture.find("UndefVarError", echo);
+    return error_pos != std::string::npos
+        && capture.find("JJMCP_COMMAND", error_pos) != std::string::npos;
+}
+
 } // namespace
 
-Result<void> ToolDispatcher::ensure_jjmcp_runtime(const int timeout_ms)
+bool RuntimeBootstrapCache::is_current(const std::string& pane_key, const std::string& generation) const
+{
+    const auto it = generations_.find(pane_key);
+    if (it == generations_.end()) {
+        return false;
+    }
+    if (generation.empty() || it->second.empty()) {
+        return true;
+    }
+    return it->second == generation;
+}
+
+void RuntimeBootstrapCache::mark(const std::string& pane_key, std::string generation)
+{
+    generations_[pane_key] = std::move(generation);
+}
+
+void RuntimeBootstrapCache::invalidate(const std::string& pane_key)
+{
+    generations_.erase(pane_key);
+}
+
+std::string pane_foreground_generation(const std::string& pane_pid)
+{
+    if (pane_pid.empty() || pane_pid.find_first_not_of("0123456789") != std::string::npos) {
+        return {};
+    }
+    std::ifstream stat_file("/proc/" + pane_pid + "/stat");
+    if (!stat_file) {
+        return {};
+    }
+    std::string line;
+    std::getline(stat_file, line);
+    // The comm field is parenthesised and may contain spaces, so parse after the last ')'. The
+    // fields that follow are state, ppid, pgrp, session, tty_nr, tpgid; tpgid is the foreground
+    // process group of the pane terminal and therefore identifies the REPL currently running there.
+    const auto comm_end = line.rfind(')');
+    if (comm_end == std::string::npos) {
+        return {};
+    }
+    std::istringstream rest(line.substr(comm_end + 1));
+    std::string field;
+    for (int i = 0; i < 6; ++i) {
+        if (!(rest >> field)) {
+            return {};
+        }
+    }
+    if (field.empty() || field == "-1") {
+        return {};
+    }
+    return pane_pid + ":" + field;
+}
+
+Result<void> ToolDispatcher::ensure_jjmcp_runtime(const int timeout_ms, const std::string& pane_pid)
 {
     if (!state_.binding) {
         return Result<void>::failure("no tmux pane is bound; call jjmcp_bind first");
     }
 
-    const std::string pane_key = state_.binding->pane_id.empty() ? state_.binding->target : state_.binding->pane_id;
-    if (tmux_runtime_bootstrapped_.contains(pane_key)) {
+    const std::string pane_key = bound_target();
+    const std::string generation = pane_foreground_generation(pane_pid);
+    if (tmux_runtime_bootstrapped_.is_current(pane_key, generation)) {
         return Result<void>::success();
     }
 
@@ -1111,7 +1187,7 @@ Result<void> ToolDispatcher::ensure_jjmcp_runtime(const int timeout_ms)
         return Result<void>::failure("failed to install JJMCP Julia runtime:\n" + text);
     }
 
-    tmux_runtime_bootstrapped_.insert(pane_key);
+    tmux_runtime_bootstrapped_.mark(pane_key, generation);
     return Result<void>::success();
 }
 
@@ -1185,174 +1261,222 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
         return ToolResult::error(acquired.error());
     }
 
-    if (const auto runtime = ensure_jjmcp_runtime(timeout_ms); !runtime) {
+    if (const auto runtime = ensure_jjmcp_runtime(timeout_ms, info.value().pane_pid); !runtime) {
         return ToolResult::error(runtime.error());
     }
 
-    const Marker marker = make_marker(next_marker_id(state_));
-    const std::string wrapped = wrap_julia_code(code, marker, timeout_ms);
-    const std::string buffer_name = "jjmcp_" + marker.id;
-    const auto start = std::chrono::steady_clock::now();
-    const auto sent = tmux_.send_text(bound_target(), wrapped, buffer_name);
-    if (!sent) {
-        return ToolResult::error(sent.error());
-    }
-
-    const auto deadline = start + std::chrono::milliseconds(timeout_ms);
-    // Fast single-line prints wrap into thousands of terminal rows and can push BEGIN out of a
-    // small capture window before the first post-send poll. Keep the polling window larger than
-    // the returned capture window; final MCP output is still capped separately below.
-    const int poll_capture_lines = std::clamp(capture_lines + 8000, 10000, kMaxCaptureLines);
-
-    // Adaptive polling: start at 50 ms, double when no growth, reset on growth, cap at 1000 ms.
-    // Replaces a fixed 75 ms loop that issued ~4000 capture-pane subprocesses per 5-min Pkg.test.
-    //
-    // Accumulator: each tmux capture-pane returns the last poll_capture_lines of the visible pane.
-    // We splice consecutive captures by their longest suffix-prefix overlap so output that has
-    // scrolled off the visible pane buffer (and thus is no longer in the next capture) is still
-    // preserved in the working set. Without this, a long compile log can push the BEGIN marker
-    // out of the capture window, leaving extract_between_markers().found_begin = false for an
-    // eval that actually succeeded.
-    std::chrono::milliseconds backoff{50};
-    constexpr std::chrono::milliseconds kBackoffMin{50};
-    constexpr std::chrono::milliseconds kBackoffMax{1000};
-    std::string accumulator;
-    std::string last_capture;
-    ExtractedOutput last_extract;
-    bool timed_out = false;
-    bool begin_trimmed = false;
-
-    constexpr std::size_t kProgressMinDelta = 4096;
-    constexpr std::size_t kProgressMaxTail = 4096;
-    std::size_t last_progress_size = 0;
-    int progress_count = 0;
-
-    while (true) {
-        const auto captured = tmux_.capture_pane(bound_target(), poll_capture_lines);
-        if (!captured) {
-            return ToolResult::error(captured.error());
+    // One paste-and-wait pass. Returns nullopt when the pane REPL rejected the wrapper because the
+    // runtime macro is gone, which means the Julia process was replaced after the last injection.
+    const auto run_marker_eval = [&](bool detect_missing_runtime) -> std::optional<ToolResult> {
+        const Marker marker = make_marker(next_marker_id(state_));
+        const std::string wrapped = wrap_julia_code(code, marker, timeout_ms);
+        const std::string buffer_name = "jjmcp_" + marker.id;
+        const auto start = std::chrono::steady_clock::now();
+        const auto sent = tmux_.send_text(bound_target(), wrapped, buffer_name);
+        if (!sent) {
+            return ToolResult::error(sent.error());
         }
-        const std::string& cap = captured.value();
 
-        bool grew = false;
-        if (accumulator.empty()) {
-            if (!cap.empty()) {
-                accumulator = cap;
-                grew = true;
+        const auto deadline = start + std::chrono::milliseconds(timeout_ms);
+        // Fast single-line prints wrap into thousands of terminal rows and can push BEGIN out of a
+        // small capture window before the first post-send poll. Keep the polling window larger than
+        // the returned capture window; final MCP output is still capped separately below.
+        const int poll_capture_lines = std::clamp(capture_lines + 8000, 10000, kMaxCaptureLines);
+
+        // Adaptive polling: start at 50 ms, double when no growth, reset on growth, cap at 1000 ms.
+        // Replaces a fixed 75 ms loop that issued ~4000 capture-pane subprocesses per 5-min Pkg.test.
+        //
+        // Accumulator: each tmux capture-pane returns the last poll_capture_lines of the visible pane.
+        // We splice consecutive captures by their longest suffix-prefix overlap so output that has
+        // scrolled off the visible pane buffer (and thus is no longer in the next capture) is still
+        // preserved in the working set. Without this, a long compile log can push the BEGIN marker
+        // out of the capture window, leaving extract_between_markers().found_begin = false for an
+        // eval that actually succeeded.
+        std::chrono::milliseconds backoff{50};
+        constexpr std::chrono::milliseconds kBackoffMin{50};
+        constexpr std::chrono::milliseconds kBackoffMax{1000};
+        constexpr int kMaxCaptureFailures = 5;
+        std::string accumulator;
+        std::string last_capture;
+        ExtractedOutput last_extract;
+        bool timed_out = false;
+        bool begin_trimmed = false;
+        int capture_failures = 0;
+
+        constexpr std::size_t kProgressMinDelta = 4096;
+        constexpr std::size_t kProgressMaxTail = 4096;
+        std::size_t last_progress_size = 0;
+        int progress_count = 0;
+
+        while (true) {
+            const auto captured = tmux_.capture_pane(bound_target(), poll_capture_lines);
+            if (!captured) {
+                // A capture can fail transiently while the tmux server is under load. Losing a poll
+                // is harmless, so keep waiting and give up only on a persistent failure.
+                if (++capture_failures > kMaxCaptureFailures) {
+                    return ToolResult::error(captured.error());
+                }
+                log::warn("capture_pane_failed",
+                          {{"error", captured.error()}, {"consecutive", capture_failures}});
+                const auto now = std::chrono::steady_clock::now();
+                if (now >= deadline) {
+                    timed_out = true;
+                    break;
+                }
+                const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+                std::this_thread::sleep_for(std::min(kBackoffMax, wait));
+                continue;
             }
-        } else if (cap != last_capture) {
-            const std::size_t overlap = compute_capture_overlap(last_capture, cap);
-            if (overlap < cap.size()) {
-                accumulator.append(cap, overlap, cap.size() - overlap);
-                grew = true;
-            }
-        }
-        last_capture = cap;
+            capture_failures = 0;
+            const std::string& cap = captured.value();
 
-        // Prefer extracting from the live capture: it is the most authoritative source for the
-        // common small-pane / not-yet-scrolled case and is immune to any imprecision in the
-        // accumulator splice. If BEGIN has already scrolled off the live capture, fall back to
-        // the accumulator, which retains everything since the first capture that saw BEGIN.
-        last_extract = extract_between_markers(cap, marker);
-        if (!last_extract.found_begin) {
-            last_extract = extract_between_markers(accumulator, marker);
-        }
-
-        // Once BEGIN is located anywhere, discard all pre-BEGIN pane history from the accumulator.
-        // Future extraction passes only need to scan from BEGIN onward, keeping the working set
-        // bounded by actual output size rather than total pane history.
-        if (!begin_trimmed && last_extract.found_begin) {
-            const auto begin_pos = accumulator.find(marker.begin);
-            if (begin_pos != std::string::npos) {
-                const auto line_start = accumulator.rfind('\n', begin_pos);
-                const std::size_t trim_to = (line_start == std::string::npos) ? 0 : line_start + 1;
-                if (trim_to > 0) {
-                    accumulator.erase(0, trim_to);
+            bool grew = false;
+            if (accumulator.empty()) {
+                if (!cap.empty()) {
+                    accumulator = cap;
+                    grew = true;
+                }
+            } else if (cap != last_capture) {
+                const std::size_t overlap = compute_capture_overlap(last_capture, cap);
+                if (overlap < cap.size()) {
+                    accumulator.append(cap, overlap, cap.size() - overlap);
+                    grew = true;
                 }
             }
-            begin_trimmed = true;
-        }
+            last_capture = cap;
 
-        // Emit a progress notification when the in-progress output between markers grows by at
-        // least kProgressMinDelta bytes. Cap the tail per notification to avoid megabyte frames
-        // when a large value is printed all at once.
-        if (progress != nullptr && progress->active() && last_extract.found_begin) {
-            const std::size_t cur = last_extract.text.size();
-            if (cur >= last_progress_size + kProgressMinDelta) {
-                std::string tail = last_extract.text.substr(last_progress_size);
-                if (tail.size() > kProgressMaxTail) {
-                    tail = tail.substr(tail.size() - kProgressMaxTail);
-                }
-                ++progress_count;
-                progress->emit(static_cast<double>(progress_count), tail);
-                last_progress_size = cur;
+            // Prefer extracting from the live capture: it is the most authoritative source for the
+            // common small-pane / not-yet-scrolled case and is immune to any imprecision in the
+            // accumulator splice. If BEGIN has already scrolled off the live capture, fall back to
+            // the accumulator, which retains everything since the first capture that saw BEGIN.
+            last_extract = extract_between_markers(cap, marker);
+            if (!last_extract.found_begin) {
+                last_extract = extract_between_markers(accumulator, marker);
             }
+
+            if (detect_missing_runtime && !last_extract.found_begin
+                && jjmcp_runtime_missing(cap, marker.id)) {
+                return std::nullopt;
+            }
+
+            // Once BEGIN is located anywhere, discard all pre-BEGIN pane history from the accumulator.
+            // Future extraction passes only need to scan from BEGIN onward, keeping the working set
+            // bounded by actual output size rather than total pane history.
+            if (!begin_trimmed && last_extract.found_begin) {
+                const auto begin_pos = accumulator.find(marker.begin);
+                if (begin_pos != std::string::npos) {
+                    const auto line_start = accumulator.rfind('\n', begin_pos);
+                    const std::size_t trim_to = (line_start == std::string::npos) ? 0 : line_start + 1;
+                    if (trim_to > 0) {
+                        accumulator.erase(0, trim_to);
+                    }
+                }
+                begin_trimmed = true;
+            }
+
+            // Emit a progress notification when the in-progress output between markers grows by at
+            // least kProgressMinDelta bytes. Cap the tail per notification to avoid megabyte frames
+            // when a large value is printed all at once.
+            if (progress != nullptr && progress->active() && last_extract.found_begin) {
+                const std::size_t cur = last_extract.text.size();
+                if (cur >= last_progress_size + kProgressMinDelta) {
+                    const std::string tail =
+                        truncate_bytes_tail(last_extract.text.substr(last_progress_size), kProgressMaxTail);
+                    ++progress_count;
+                    progress->emit(static_cast<double>(progress_count), tail);
+                    last_progress_size = cur;
+                }
+            }
+
+            if (!last_extract.found_end && accumulator.size() > kMaxEvalAccumulatorBytes) {
+                if (last_extract.found_begin) {
+                    const bool saw_out_end = accumulator.find(marker.out_end) != std::string::npos;
+                    const bool saw_val_end = accumulator.find(marker.val_end) != std::string::npos;
+                    const bool saw_error = accumulator.find(marker.error) != std::string::npos;
+                    const bool saw_backtrace = accumulator.find(marker.bt) != std::string::npos;
+                    const bool saw_end = accumulator.find(marker.end) != std::string::npos;
+                    accumulator = compact_marker_accumulator(last_extract, marker, saw_out_end,
+                                                             saw_val_end, saw_error, saw_backtrace,
+                                                             saw_end);
+                    last_extract = extract_between_markers(accumulator, marker);
+                    last_progress_size = 0;
+                } else {
+                    // BEGIN is in no capture we have seen, so nothing in the head can be recovered.
+                    // Drop it: the working set must stay bounded however much the pane prints.
+                    const std::size_t drop = accumulator.size() - kMaxEvalAccumulatorBytes / 2;
+                    const auto line_end = accumulator.find('\n', drop);
+                    accumulator.erase(0, line_end == std::string::npos ? drop : line_end + 1);
+                }
+            }
+
+            if (last_extract.found_end) {
+                break;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                timed_out = true;
+                break;
+            }
+
+            backoff = grew ? kBackoffMin : std::min(backoff * 2, kBackoffMax);
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            std::this_thread::sleep_for(std::min(backoff, remaining));
         }
 
-        if (!last_extract.found_end && last_extract.found_begin
-            && accumulator.size() > kMaxEvalAccumulatorBytes) {
-            const bool saw_out_end = accumulator.find(marker.out_end) != std::string::npos;
-            const bool saw_val_end = accumulator.find(marker.val_end) != std::string::npos;
-            const bool saw_error = accumulator.find(marker.error) != std::string::npos;
-            const bool saw_backtrace = accumulator.find(marker.bt) != std::string::npos;
-            const bool saw_end = accumulator.find(marker.end) != std::string::npos;
-            accumulator = compact_marker_accumulator(last_extract, marker, saw_out_end, saw_val_end,
-                                                     saw_error, saw_backtrace, saw_end);
-            last_extract = extract_between_markers(accumulator, marker);
-            last_progress_size = 0;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start).count();
+
+        const auto cap_lines = static_cast<std::size_t>(capture_lines);
+        nlohmann::json structured = {
+            {"elapsed_ms", elapsed},
+            {"timed_out", timed_out},
+            {"found_begin", last_extract.found_begin},
+            {"found_end", last_extract.found_end},
+            {"julia_error", last_extract.julia_error},
+            {"marker_id", marker.id},
+            {"stdout",        truncate_tool_tail(last_extract.stdout_text,    cap_lines)},
+            {"value_repr",    truncate_tool_tail(last_extract.value_repr,     cap_lines)},
+            {"error_message", truncate_tool_tail(last_extract.error_message,  cap_lines)},
+            {"backtrace",     truncate_tool_tail(last_extract.backtrace,      200, kMaxMcpBacktraceBytes)},
+            {"transport", "tmux"},
+        };
+
+        if (!timed_out) {
+            auto text = truncate_tool_tail(last_extract.text, cap_lines);
+            ToolResult result = last_extract.julia_error ? ToolResult::error(std::move(text))
+                                                         : ToolResult::success(std::move(text));
+            return result.with_structured(std::move(structured));
         }
 
-        if (last_extract.found_end) {
-            break;
+        std::ostringstream out;
+        out << "Timed out after " << timeout_ms << " ms waiting for " << marker.end;
+        if (last_extract.found_begin && !last_extract.text.empty()) {
+            out << "\nPartial output between markers:\n";
+            out << truncate_tool_tail(last_extract.text, cap_lines);
+        } else if (!last_capture.empty()) {
+            out << "\nRecent pane output:\n";
+            out << truncate_tool_tail(last_capture, static_cast<std::size_t>(std::min(capture_lines, 200)));
         }
-
-        const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
-            timed_out = true;
-            break;
-        }
-
-        backoff = grew ? kBackoffMin : std::min(backoff * 2, kBackoffMax);
-        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-        std::this_thread::sleep_for(std::min(backoff, remaining));
-    }
-
-    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - start).count();
-
-
-    const auto cap_lines = static_cast<std::size_t>(capture_lines);
-    nlohmann::json structured = {
-        {"elapsed_ms", elapsed},
-        {"timed_out", timed_out},
-        {"found_begin", last_extract.found_begin},
-        {"found_end", last_extract.found_end},
-        {"julia_error", last_extract.julia_error},
-        {"marker_id", marker.id},
-        {"stdout",        truncate_tool_tail(last_extract.stdout_text,    cap_lines)},
-        {"value_repr",    truncate_tool_tail(last_extract.value_repr,     cap_lines)},
-        {"error_message", truncate_tool_tail(last_extract.error_message,  cap_lines)},
-        {"backtrace",     truncate_tool_tail(last_extract.backtrace,      200, kMaxMcpBacktraceBytes)},
-        {"transport", "tmux"},
+        return ToolResult::error(out.str()).with_structured(std::move(structured));
     };
 
-    if (!timed_out) {
-        auto text = truncate_tool_tail(last_extract.text, static_cast<std::size_t>(capture_lines));
-        ToolResult result = last_extract.julia_error ? ToolResult::error(std::move(text))
-                                                     : ToolResult::success(std::move(text));
-        return result.with_structured(std::move(structured));
+    if (auto result = run_marker_eval(true); result) {
+        return std::move(*result);
     }
 
-    std::ostringstream out;
-    out << "Timed out after " << timeout_ms << " ms waiting for " << marker.end;
-    if (last_extract.found_begin && !last_extract.text.empty()) {
-        out << "\nPartial output between markers:\n";
-        out << truncate_tool_tail(last_extract.text, static_cast<std::size_t>(capture_lines));
-    } else if (!last_capture.empty()) {
-        out << "\nRecent pane output:\n";
-        out << truncate_tool_tail(last_capture, static_cast<std::size_t>(std::min(capture_lines, 200)));
+    // The Julia process in the pane was replaced after the runtime was injected. Re-inject and
+    // retry once; the retry ignores the detection so a stale error in the scrollback cannot loop.
+    log::warn("jjmcp_runtime_reinjected", {{"target", bound_target()}});
+    tmux_runtime_bootstrapped_.invalidate(bound_target());
+    if (const auto runtime = ensure_jjmcp_runtime(timeout_ms, info.value().pane_pid); !runtime) {
+        return ToolResult::error(runtime.error());
     }
-    return ToolResult::error(out.str()).with_structured(std::move(structured));
+    if (auto result = run_marker_eval(false); result) {
+        return std::move(*result);
+    }
+    return ToolResult::error("the Julia REPL in " + bound_target()
+                             + " does not accept @JJMCP_COMMAND after reinstalling the runtime");
 }
 
 namespace {

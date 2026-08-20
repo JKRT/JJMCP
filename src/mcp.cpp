@@ -60,9 +60,16 @@ Result<ReadMessage> read_mcp_message(std::istream& input)
     return Result<ReadMessage>::success(ReadMessage{true, {}});
 }
 
+std::string encode_mcp_frame(const nlohmann::json& message)
+{
+    // Pane output is arbitrary bytes and a strict dump() throws on the first invalid UTF-8 byte,
+    // which would take the whole server down mid-frame. Substitute U+FFFD instead.
+    return message.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 void write_mcp_message(std::ostream& output, const nlohmann::json& message)
 {
-    output << message.dump() << '\n';
+    output << encode_mcp_frame(message) << '\n';
     output.flush();
 }
 
@@ -159,8 +166,16 @@ std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request
             progress_token = params["_meta"]["progressToken"];
         }
         ProgressEmitter emitter(std::cout, stdout_mutex, std::move(progress_token));
-        const auto result = tools.call(params["name"], arguments, &emitter);
-        return make_jsonrpc_result(id, tool_result_json(result));
+        // A throwing tool call must not reach the worker thread: an escaped exception terminates the
+        // process and the client sees the transport close.
+        try {
+            const auto result = tools.call(params["name"], arguments, &emitter);
+            return make_jsonrpc_result(id, tool_result_json(result));
+        } catch (const std::exception& e) {
+            return make_jsonrpc_error(id, -32603, std::string("tool call failed: ") + e.what());
+        } catch (...) {
+            return make_jsonrpc_error(id, -32603, "tool call failed with an unknown exception");
+        }
     }
 
     return make_jsonrpc_error(id, -32601, "Method not found");

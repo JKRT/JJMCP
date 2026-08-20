@@ -8,7 +8,7 @@
 #include <filesystem>
 #include <nlohmann/json.hpp>
 #include <string>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 namespace jjmcp {
@@ -44,6 +44,24 @@ struct TestSummaryResult {
 
 TestSummaryResult parse_test_summary(const std::string& capture);
 
+// Tracks the panes that already carry the Main.JJMCPRuntime module. The generation token names the
+// process that currently owns the pane foreground, so a REPL that exited and was restarted in the
+// same pane no longer matches its cached entry and gets the runtime injected again. An empty token
+// means the generation could not be determined; the pane key alone then decides.
+class RuntimeBootstrapCache {
+public:
+    [[nodiscard]] bool is_current(const std::string& pane_key, const std::string& generation) const;
+    void mark(const std::string& pane_key, std::string generation);
+    void invalidate(const std::string& pane_key);
+
+private:
+    std::unordered_map<std::string, std::string> generations_;
+};
+
+// Generation token for a pane, derived from the foreground process group of the pane process.
+// Empty when it cannot be read.
+std::string pane_foreground_generation(const std::string& pane_pid);
+
 class ToolDispatcher {
 public:
     ToolDispatcher(ServerState& state, const Tmux& tmux, std::filesystem::path cwd);
@@ -74,7 +92,7 @@ private:
     ToolResult eval_code(const std::string& code, int timeout_ms, int capture_lines,
                          bool force = false, ProgressEmitter* progress = nullptr,
                          const std::string& transport = "auto");
-    Result<void> ensure_jjmcp_runtime(const int timeout_ms);
+    Result<void> ensure_jjmcp_runtime(int timeout_ms, const std::string& pane_pid);
     std::string bound_target() const;
 
     ServerState& state_;
@@ -83,7 +101,7 @@ private:
     // Set by call() for the duration of one tool dispatch and read by eval_code() to emit
     // progress notifications. Null if the client did not pass a progressToken.
     ProgressEmitter* current_progress_ = nullptr;
-    std::unordered_set<std::string> tmux_runtime_bootstrapped_;
+    RuntimeBootstrapCache tmux_runtime_bootstrapped_;
 };
 
 } // namespace jjmcp

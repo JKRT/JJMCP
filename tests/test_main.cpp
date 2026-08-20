@@ -1,13 +1,13 @@
 #include "julia_wrap.hpp"
+#include "mcp.hpp"
 #include "socket_client.hpp"
 #include "tmux.hpp"
 #include "tools.hpp"
 
 #include <cstdlib>
-
-#include <cstdlib>
 #include <iostream>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 namespace {
@@ -279,6 +279,60 @@ void test_compute_capture_overlap()
           "overlap returns prior.size() when prior is a strict prefix of current (no scroll case)");
 }
 
+void test_runtime_bootstrap_cache()
+{
+    jjmcp::RuntimeBootstrapCache cache;
+    const std::string pane = "%7";
+
+    check(!cache.is_current(pane, "100:200"), "unknown pane is not bootstrapped");
+
+    cache.mark(pane, "100:200");
+    check(cache.is_current(pane, "100:200"), "same pane and same REPL process stays bootstrapped");
+    check(!cache.is_current(pane, "100:300"), "restarted REPL in the same pane needs bootstrapping");
+    check(!cache.is_current("%8", "100:200"), "other pane is not bootstrapped");
+
+    cache.invalidate(pane);
+    check(!cache.is_current(pane, "100:200"), "invalidate forces re-injection");
+
+    // Unknown generation on either side degrades to caching by pane key alone.
+    cache.mark(pane, "");
+    check(cache.is_current(pane, "100:200"), "unknown stored generation trusts the pane entry");
+    cache.mark(pane, "100:200");
+    check(cache.is_current(pane, ""), "unknown probed generation trusts the pane entry");
+}
+
+void test_pane_foreground_generation()
+{
+    using jjmcp::pane_foreground_generation;
+
+    check(pane_foreground_generation("").empty(), "generation empty for empty pid");
+    check(pane_foreground_generation("bash").empty(), "generation empty for non-numeric pid");
+    check(pane_foreground_generation("2147483646").empty(), "generation empty for unused pid");
+
+    const std::string self = std::to_string(static_cast<long long>(::getpid()));
+    const auto generation = pane_foreground_generation(self);
+    check(generation.empty() || generation.rfind(self + ":", 0) == 0,
+          "generation for a live pid is prefixed with that pid");
+}
+
+void test_encode_mcp_frame_tolerates_invalid_utf8()
+{
+    nlohmann::json message = {
+        {"jsonrpc", "2.0"},
+        {"result", {{"text", std::string("julia backtrace \xff\xfe tail")}}},
+    };
+    std::string encoded;
+    bool threw = false;
+    try {
+        encoded = jjmcp::encode_mcp_frame(message);
+    } catch (const std::exception&) {
+        threw = true;
+    }
+    check(!threw, "frame encoding does not throw on invalid UTF-8 pane bytes");
+    check(encoded.find("julia backtrace") != std::string::npos,
+          "frame encoding keeps the valid part of the text");
+}
+
 } // namespace
 
 int main()
@@ -297,6 +351,9 @@ int main()
     test_parse_test_summary_pass_only();
     test_parse_test_summary_with_failure();
     test_parse_test_summary_malformed();
+    test_runtime_bootstrap_cache();
+    test_pane_foreground_generation();
+    test_encode_mcp_frame_tolerates_invalid_utf8();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

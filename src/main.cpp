@@ -5,6 +5,7 @@
 #include "tools.hpp"
 
 #include <condition_variable>
+#include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
@@ -56,6 +57,8 @@ int serve()
     using namespace jjmcp;
 
     std::ios::sync_with_stdio(false);
+    // A client that goes away mid-frame must surface as a stream error, not as a fatal SIGPIPE.
+    std::signal(SIGPIPE, SIG_IGN);
 
     ServerState state;
     std::error_code ec;
@@ -101,6 +104,25 @@ int serve()
             || method == "resources/list" || method == "resources/read";
     };
 
+    // Last line of defence: an exception that escapes a dispatch terminates the process and drops
+    // the client connection, so every path reports it as a JSON-RPC error instead.
+    const auto handle_request = [&](const nlohmann::json& request) {
+        try {
+            const auto response = dispatch_mcp_request(request, tools, stdout_mutex);
+            if (response) {
+                write_locked(*response);
+            }
+        } catch (const std::exception& e) {
+            log::warn("dispatch_exception", {{"error", e.what()}});
+            write_locked(make_jsonrpc_error(request.contains("id") ? request["id"] : nullptr, -32603,
+                                            std::string("internal error: ") + e.what()));
+        } catch (...) {
+            log::warn("dispatch_exception", {{"error", "unknown"}});
+            write_locked(make_jsonrpc_error(request.contains("id") ? request["id"] : nullptr, -32603,
+                                            "internal error"));
+        }
+    };
+
     std::queue<nlohmann::json> jobs;
     std::mutex jobs_mutex;
     std::condition_variable jobs_cv;
@@ -118,10 +140,7 @@ int serve()
                 request = std::move(jobs.front());
                 jobs.pop();
             }
-            const auto response = dispatch_mcp_request(request, tools, stdout_mutex);
-            if (response) {
-                write_locked(*response);
-            }
+            handle_request(request);
         }
     });
 
@@ -170,10 +189,7 @@ int serve()
             continue;
         }
 
-        const auto response = dispatch_mcp_request(request, tools, stdout_mutex);
-        if (response) {
-            write_locked(*response);
-        }
+        handle_request(request);
     }
 }
 

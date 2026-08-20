@@ -18,6 +18,8 @@ struct ReadMessage {
 };
 
 Result<ReadMessage> read_mcp_message(std::istream& input);
+// Serialize one frame. Invalid UTF-8 in captured output is replaced, never thrown on.
+std::string encode_mcp_frame(const nlohmann::json& message);
 void write_mcp_message(std::ostream& output, const nlohmann::json& message);
 
 nlohmann::json make_jsonrpc_result(const nlohmann::json& id, nlohmann::json result);
