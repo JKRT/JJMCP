@@ -1,3 +1,5 @@
 build/
 .jjmcp/
 INSIGHTS.md
+.cache/
+.clangd
