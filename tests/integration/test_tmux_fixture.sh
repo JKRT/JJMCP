@@ -14,8 +14,12 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 JJMCP="$PROJECT_ROOT/build/jjmcp"
 SESSION="jjmcp-itest-$$"
 
+PREV_HISTORY_LIMIT=$(tmux show-options -g history-limit 2>/dev/null | awk '{print $2}')
+[ -n "$PREV_HISTORY_LIMIT" ] || PREV_HISTORY_LIMIT=2000
+
 cleanup() {
     tmux kill-session -t "$SESSION" 2>/dev/null || true
+    tmux set-option -g history-limit "$PREV_HISTORY_LIMIT" 2>/dev/null || true
 }
 trap cleanup EXIT
 
@@ -33,7 +37,17 @@ done
 # Spawn an isolated session on the user's tmux server. jjmcp does not currently retarget the tmux
 # control socket per-invocation, so a private -L socket would not work; we use a uniquely-named
 # session (jjmcp-itest-$$) which is just as test-isolated and is cleaned up on exit.
+# tmux snapshots history-limit into a pane's grid at creation time; setting it on the session
+# afterward does not affect an already-created pane. Bump the global default before creating the
+# pane, restored on exit above, so the large single-line test below (which wraps to thousands of
+# 80-column rows) is not silently truncated by history eviction before capture-pane sees it.
+# `set-option -g` requires a running server, and a fresh `start-server` can exit-empty again
+# before the next command connects, so bootstrap with a throwaway session first.
+BOOT_SESSION="jjmcp-itest-boot-$$"
+tmux new-session -d -s "$BOOT_SESSION" 2>/dev/null || true
+tmux set-option -g history-limit 50000
 tmux new-session -d -s "$SESSION" "julia --startup-file=no"
+tmux kill-session -t "$BOOT_SESSION" 2>/dev/null || true
 
 # Wait for the Julia prompt to appear in the pane.
 for i in $(seq 1 30); do
@@ -52,7 +66,7 @@ echo "test pane: $PANE_ID (session $SESSION)"
 # Run jjmcp from a fresh temp cwd so a pre-existing .jjmcp/config.json from the project does not
 # pre-bind us to a stale pane.
 TEST_CWD=$(mktemp -d)
-trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true; rm -rf "$TEST_CWD"' EXIT
+trap 'tmux kill-session -t "$SESSION" 2>/dev/null || true; tmux set-option -g history-limit "$PREV_HISTORY_LIMIT" 2>/dev/null || true; rm -rf "$TEST_CWD"' EXIT
 run_jjmcp() {
     (cd "$TEST_CWD" && "$JJMCP" serve 2>/dev/null)
 }
