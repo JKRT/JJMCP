@@ -28,11 +28,13 @@ namespace {
 constexpr int kDefaultTimeoutMs = 10000;
 constexpr int kDefaultCaptureLines = 2000;
 constexpr int kMaxCaptureLines = 50000;
-constexpr std::size_t kMaxMcpTextBytes = 256 * 1024;
-constexpr std::size_t kMaxMcpBacktraceBytes = 128 * 1024;
 constexpr std::size_t kMaxSocketFieldBytes = 240 * 1024;
-constexpr std::size_t kMaxEvalAccumulatorBytes = 1024 * 1024;
-constexpr std::size_t kEvalAccumulatorTailLines = 2000;
+// A submitted job is polled in the foreground only long enough to catch a REPL that rejects the
+// wrapper outright; after that the background poller owns it.
+constexpr int kJobBootstrapWindowMs = 1500;
+constexpr int kDefaultJobTimeoutMs = 3600000;
+constexpr int kDefaultWaitMs = 60000;
+constexpr int kDefaultStatusLines = 200;
 
 nlohmann::json object_schema(nlohmann::json properties, nlohmann::json required = nlohmann::json::array())
 {
@@ -87,6 +89,39 @@ nlohmann::json eval_output_schema()
     };
 }
 
+// Superset of eval_output_schema: every field the eval path already emitted, plus the job identity
+// and liveness fields that make a result recoverable after the waiting window closes.
+nlohmann::json job_output_schema()
+{
+    nlohmann::json schema = eval_output_schema();
+    auto& properties = schema["properties"];
+    properties["job_id"] = {{"type", "string"}, {"description", "equal to marker_id"}};
+    properties["state"] = {
+        {"type", "string"},
+        {"enum", nlohmann::json::array({"running", "completed", "failed", "timed_out"})},
+        {"description", "running means the job is still being polled; completed with julia_error=true means Julia threw"},
+    };
+    properties["target"] = {{"type", "string"}};
+    properties["submitted_at"] = {{"type", "string"}};
+    properties["detached"] = {{"type", "boolean"}, {"description", "polled by a background thread"}};
+    properties["timeout_ms"] = {{"type", "integer"}};
+    properties["output_bytes"] = {{"type", "integer"}};
+    properties["live_tail"] = {{"type", "string"}, {"description", "tail of the output so far, running jobs only"}};
+    properties["failure"] = {{"type", "string"}, {"description", "why jjmcp lost the job, not a Julia error"}};
+    properties["last_output_unix_ms"] = {{"type", "integer"}};
+    properties["last_output_age_ms"] = {{"type", "integer"}};
+    properties["repl_pid"] = {{"type", "integer"}, {"description", "foreground process group of the pane"}};
+    properties["cpu_seconds"] = {{"type", "number"}};
+    properties["rss_bytes"] = {{"type", "integer"}};
+    properties["proc_state"] = {{"type", "string"}};
+    properties["from_result_store"] = {{"type", "boolean"}};
+    properties["recovered_from_scrollback"] = {
+        {"type", "boolean"},
+        {"description", "true when the result was rebuilt from pane history, which may be incomplete"},
+    };
+    return schema;
+}
+
 nlohmann::json test_summary_output_schema()
 {
     return {
@@ -137,58 +172,6 @@ int optional_int(const nlohmann::json& args, const char* key, int default_value,
         return default_value;
     }
     return std::clamp(args[key].get<int>(), min_value, max_value);
-}
-
-std::string truncate_tool_tail(const std::string& text, std::size_t max_lines,
-                               std::size_t max_bytes = kMaxMcpTextBytes)
-{
-    return truncate_bytes_tail(truncate_lines_tail(text, max_lines), max_bytes);
-}
-
-void append_line(std::string& out, const std::string& line)
-{
-    out += line;
-    out.push_back('\n');
-}
-
-void append_block(std::string& out, const std::string& text)
-{
-    if (text.empty()) {
-        return;
-    }
-    out += text;
-    if (out.back() != '\n') {
-        out.push_back('\n');
-    }
-}
-
-std::string compact_marker_accumulator(const ExtractedOutput& extracted, const Marker& marker,
-                                       bool saw_out_end, bool saw_val_end, bool saw_error,
-                                       bool saw_backtrace, bool saw_end)
-{
-    std::string out;
-    append_line(out, marker.begin);
-    append_block(out, truncate_tool_tail(extracted.stdout_text, kEvalAccumulatorTailLines));
-
-    if (saw_error) {
-        append_line(out, marker.error);
-        append_block(out, truncate_tool_tail(extracted.error_message, kEvalAccumulatorTailLines));
-        if (saw_backtrace) {
-            append_line(out, marker.bt);
-            append_block(out, truncate_tool_tail(extracted.backtrace, 200, kMaxMcpBacktraceBytes));
-        }
-    } else if (saw_out_end) {
-        append_line(out, marker.out_end);
-        append_block(out, truncate_tool_tail(extracted.value_repr, kEvalAccumulatorTailLines));
-        if (saw_val_end) {
-            append_line(out, marker.val_end);
-        }
-    }
-
-    if (saw_end) {
-        append_line(out, marker.end);
-    }
-    return out;
 }
 
 std::string to_lower(std::string value)
@@ -522,59 +505,6 @@ bool is_known_non_julia_prompt(const std::string& last_line)
 // Stale-lock detection: if the recorded pid is no longer alive, we treat the lock as orphaned and
 // reclaim it. This is best-effort; the kernel cannot tell us whether a freshly recycled pid is the
 // same process, so a vanishingly small race window remains.
-class AdvisoryLock {
-public:
-    explicit AdvisoryLock(std::filesystem::path path) : path_(std::move(path)) {}
-    AdvisoryLock(const AdvisoryLock&) = delete;
-    AdvisoryLock& operator=(const AdvisoryLock&) = delete;
-    ~AdvisoryLock() { release(); }
-
-    Result<void> acquire(const std::string& marker_id)
-    {
-        std::error_code ec;
-        std::filesystem::create_directories(path_.parent_path(), ec);
-        for (int attempt = 0; attempt < 2; ++attempt) {
-            const int fd = ::open(path_.c_str(), O_CREAT | O_EXCL | O_WRONLY, 0644);
-            if (fd >= 0) {
-                fd_ = fd;
-                const std::string content = std::to_string(static_cast<long long>(::getpid())) + " "
-                                            + marker_id + "\n";
-                const auto written = ::write(fd, content.data(), content.size());
-                (void)written;  // best-effort; the lock is in place even if write fails
-                return Result<void>::success();
-            }
-            if (errno != EEXIST) {
-                return Result<void>::failure(std::string("could not open lock file: ")
-                                             + std::strerror(errno));
-            }
-            // Lock exists; check if it is stale (process gone).
-            std::ifstream f(path_);
-            long long pid = 0;
-            f >> pid;
-            if (pid > 0 && ::kill(static_cast<pid_t>(pid), 0) == -1 && errno == ESRCH) {
-                ::unlink(path_.c_str());
-                continue;
-            }
-            return Result<void>::failure("an evaluation is already in progress (lock at "
-                                         + path_.string() + ")");
-        }
-        return Result<void>::failure("could not acquire advisory lock after retry");
-    }
-
-    void release()
-    {
-        if (fd_ >= 0) {
-            ::close(fd_);
-            ::unlink(path_.c_str());
-            fd_ = -1;
-        }
-    }
-
-private:
-    std::filesystem::path path_;
-    int fd_ = -1;
-};
-
 std::string format_pane_info(const PaneInfo& info)
 {
     std::ostringstream out;
@@ -598,8 +528,14 @@ TestSummaryResult parse_test_summary(const std::string& capture)
 }
 
 ToolDispatcher::ToolDispatcher(ServerState& state, const Tmux& tmux, std::filesystem::path cwd)
-    : state_(state), tmux_(tmux), cwd_(std::move(cwd))
+    : state_(state), tmux_(tmux), cwd_(std::move(cwd)),
+      jobs_(state.config_path.parent_path() / "jobs")
 {
+}
+
+void ToolDispatcher::shutdown()
+{
+    jobs_.shutdown();
 }
 
 nlohmann::json ToolDispatcher::list_tools_json() const
@@ -638,9 +574,80 @@ nlohmann::json ToolDispatcher::list_tools_json() const
                 {"force", {{"type", "boolean"}, {"description", "skip pane-mode pre-check (default false)"}}},
                 {"validate_syntax", {{"type", "boolean"}, {"description", "parse code via a 2s julia Meta.parseall before paste; accepts multi-statement input (default true)"}}},
                 {"transport", {{"type", "string"}, {"enum", nlohmann::json::array({"auto", "tmux", "socket"})}, {"description", "auto (default), tmux (force marker path), or socket (require JJMCPHelper.jl)"}}},
+                {"detach_on_timeout", {{"type", "boolean"}, {"description", "when the waiting window expires, keep polling the marker in the background and return state=running with a job_id instead of an error (default true)"}}},
             },
             nlohmann::json::array({"code"})),
-        eval_output_schema()));
+        job_output_schema()));
+
+    tools.push_back(tool_schema(
+        "jjmcp_eval_async",
+        "Submit Julia code to the bound REPL and return a job_id immediately. The job keeps being "
+        "polled in the background, so its output survives a client timeout or reconnection. Follow "
+        "with jjmcp_wait, jjmcp_job_status or jjmcp_result.",
+        object_schema(
+            {
+                {"code", {{"type", "string"}}},
+                {"timeout_ms", {{"type", "integer"}, {"minimum", 1}, {"maximum", state_.max_job_ms}, {"description", "how long the job may run before it is marked timed_out"}}},
+                {"capture_lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", kMaxCaptureLines}}},
+                {"force", {{"type", "boolean"}, {"description", "skip pane-mode pre-check (default false)"}}},
+                {"validate_syntax", {{"type", "boolean"}, {"description", "parse code via a 2s julia Meta.parseall before paste (default true)"}}},
+            },
+            nlohmann::json::array({"code"})),
+        job_output_schema()));
+
+    tools.push_back(tool_schema(
+        "jjmcp_wait",
+        "Wait for an already-running job or marker id to finish, without resending the code. Falls "
+        "back to the stored result, then to the pane scrollback, for a marker this process does not "
+        "track. Returns state=running when the waiting window expires; the job keeps running.",
+        object_schema(
+            {
+                {"job_id", {{"type", "string"}, {"description", "job id, which is the marker id"}}},
+                {"marker_id", {{"type", "string"}, {"description", "alias for job_id"}}},
+                {"timeout_ms", {{"type", "integer"}, {"minimum", 1}, {"maximum", state_.max_timeout_ms}}},
+                {"capture_lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", kMaxCaptureLines}}},
+            }),
+        job_output_schema()));
+
+    tools.push_back(tool_schema(
+        "jjmcp_job_status",
+        "Report a job's state, elapsed time, output activity, and the REPL process counters (pid, "
+        "cpu seconds, RSS) read from /proc. Answers while Julia is busy. Defaults to the most recent job.",
+        object_schema(
+            {
+                {"job_id", {{"type", "string"}}},
+                {"marker_id", {{"type", "string"}, {"description", "alias for job_id"}}},
+                {"capture_lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", kMaxCaptureLines}}},
+            }),
+        job_output_schema()));
+
+    tools.push_back(tool_schema(
+        "jjmcp_result",
+        "Retrieve a job's structured result after any client timeout or reconnection. Reads the "
+        "in-memory job first, then the bounded on-disk result store.",
+        object_schema(
+            {
+                {"job_id", {{"type", "string"}}},
+                {"marker_id", {{"type", "string"}, {"description", "alias for job_id"}}},
+                {"capture_lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", kMaxCaptureLines}}},
+            }),
+        job_output_schema()));
+
+    tools.push_back(tool_schema(
+        "jjmcp_capture_job",
+        "Return the output of one job by marker, instead of the last N lines of the pane. Safe for "
+        "long runs: unrelated pane traffic cannot appear in the result.",
+        object_schema(
+            {
+                {"job_id", {{"type", "string"}}},
+                {"marker_id", {{"type", "string"}, {"description", "alias for job_id"}}},
+                {"lines", {{"type", "integer"}, {"minimum", 1}, {"maximum", kMaxCaptureLines}}},
+            })));
+
+    tools.push_back(tool_schema(
+        "jjmcp_list_jobs",
+        "List the jobs this jjmcp process tracks, newest last.",
+        object_schema(nlohmann::json::object())));
 
     tools.push_back(tool_schema(
         "jjmcp_capture",
@@ -759,6 +766,15 @@ ToolResult ToolDispatcher::call(const std::string& name, const nlohmann::json& a
     if (name == "jjmcp_pkg_status") {
         return pkg_status(arguments);
     }
+    if (name == "jjmcp_eval_async") {
+        return eval_async(arguments);
+    }
+    if (name == "jjmcp_wait") {
+        return wait_for_job(arguments);
+    }
+    if (is_control_plane_tool(name)) {
+        return call_control_plane(name, arguments);
+    }
     return ToolResult::error("unknown tool: " + name);
 }
 
@@ -800,6 +816,7 @@ ToolResult ToolDispatcher::bind(const nlohmann::json& arguments)
 
     const auto config_base = config_base_from_project(cwd_, project_root);
     set_binding(state_, std::move(binding), config_base);
+    jobs_.set_dir(state_.config_path.parent_path() / "jobs");
     const auto saved = save_config(state_);
 
     std::ostringstream out;
@@ -862,7 +879,8 @@ ToolResult ToolDispatcher::eval(const nlohmann::json& arguments)
                                      + ok.error());
         }
     }
-    return eval_code(code, timeout_ms, capture_lines, force, nullptr, transport);
+    const bool detach_on_timeout = arguments.value("detach_on_timeout", true);
+    return eval_code(code, timeout_ms, capture_lines, force, nullptr, transport, detach_on_timeout);
 }
 
 ToolResult ToolDispatcher::capture(const nlohmann::json& arguments) const
@@ -1043,20 +1061,6 @@ ToolResult socket_response_to_tool_result(const SocketEvalResponse& resp, const 
     return ToolResult::error(std::move(text)).with_structured(std::move(structured));
 }
 
-// The REPL rejects the pasted wrapper with an UndefVarError when Main.JJMCPRuntime is gone, which
-// happens when the Julia process in the pane exited and a new one took its place. Scan only after
-// the echo of this eval's marker id, so an older failure in the scrollback cannot trigger a rerun.
-bool jjmcp_runtime_missing(const std::string& capture, const std::string& marker_id)
-{
-    const auto echo = capture.rfind(marker_id);
-    if (echo == std::string::npos) {
-        return false;
-    }
-    const auto error_pos = capture.find("UndefVarError", echo);
-    return error_pos != std::string::npos
-        && capture.find("JJMCP_COMMAND", error_pos) != std::string::npos;
-}
-
 } // namespace
 
 bool RuntimeBootstrapCache::is_current(const std::string& pane_key, const std::string& generation) const
@@ -1083,33 +1087,13 @@ void RuntimeBootstrapCache::invalidate(const std::string& pane_key)
 
 std::string pane_foreground_generation(const std::string& pane_pid)
 {
-    if (pane_pid.empty() || pane_pid.find_first_not_of("0123456789") != std::string::npos) {
+    // The foreground process group of the pane terminal identifies the REPL currently running
+    // there, so a restarted Julia in the same pane gets a different token.
+    const long long foreground = pane_foreground_pid(pane_pid);
+    if (foreground <= 0) {
         return {};
     }
-    std::ifstream stat_file("/proc/" + pane_pid + "/stat");
-    if (!stat_file) {
-        return {};
-    }
-    std::string line;
-    std::getline(stat_file, line);
-    // The comm field is parenthesised and may contain spaces, so parse after the last ')'. The
-    // fields that follow are state, ppid, pgrp, session, tty_nr, tpgid; tpgid is the foreground
-    // process group of the pane terminal and therefore identifies the REPL currently running there.
-    const auto comm_end = line.rfind(')');
-    if (comm_end == std::string::npos) {
-        return {};
-    }
-    std::istringstream rest(line.substr(comm_end + 1));
-    std::string field;
-    for (int i = 0; i < 6; ++i) {
-        if (!(rest >> field)) {
-            return {};
-        }
-    }
-    if (field.empty() || field == "-1") {
-        return {};
-    }
-    return pane_pid + ":" + field;
+    return pane_pid + ":" + std::to_string(foreground);
 }
 
 Result<void> ToolDispatcher::ensure_jjmcp_runtime(const int timeout_ms, const std::string& pane_pid)
@@ -1191,30 +1175,243 @@ Result<void> ToolDispatcher::ensure_jjmcp_runtime(const int timeout_ms, const st
     return Result<void>::success();
 }
 
+namespace {
+
+// Text payload for a finished job, mirroring the pre-job behaviour: stdout plus the value repr on
+// success, the showerror message plus backtrace on a Julia error.
+std::string job_text(const nlohmann::json& snapshot)
+{
+    const std::string error_message = snapshot.value("error_message", "");
+    const std::string backtrace = snapshot.value("backtrace", "");
+    if (snapshot.value("julia_error", false)) {
+        std::string text = error_message;
+        if (!backtrace.empty()) {
+            if (!text.empty() && text.back() != '\n') text.push_back('\n');
+            text += backtrace;
+        }
+        return truncate_bytes_tail(text, kMaxMcpTextBytes);
+    }
+    std::string text = snapshot.value("stdout", "");
+    const std::string value_repr = snapshot.value("value_repr", "");
+    if (!value_repr.empty()) {
+        if (!text.empty() && text.back() != '\n') text.push_back('\n');
+        text += value_repr;
+    }
+    return truncate_bytes_tail(text, kMaxMcpTextBytes);
+}
+
+// Rebuild a ToolResult from a stored job record, so a result survives eviction from memory, a
+// client reconnect, or a jjmcp restart even when tmux scrollback no longer holds the output.
+ToolResult persisted_job_result(const nlohmann::json& stored)
+{
+    nlohmann::json structured = stored;
+    structured["from_result_store"] = true;
+    const std::string state = structured.value("state", "unknown");
+    if (state == "completed") {
+        std::string text = job_text(structured);
+        ToolResult result = structured.value("julia_error", false)
+                                ? ToolResult::error(std::move(text))
+                                : ToolResult::success(std::move(text));
+        return result.with_structured(std::move(structured));
+    }
+
+    std::ostringstream out;
+    out << "Stored job " << structured.value("job_id", std::string()) << " ended as " << state;
+    if (const std::string failure = structured.value("failure", ""); !failure.empty()) {
+        out << ": " << failure;
+    }
+    if (const std::string text = structured.value("text", ""); !text.empty()) {
+        out << "\nOutput:\n" << text;
+    }
+    return ToolResult::error(out.str()).with_structured(std::move(structured));
+}
+
+// Uniform ToolResult for any job state. `detached` reports a job that outlived its waiting window
+// and is still being polled in the background.
+ToolResult job_to_tool_result(const EvalJob& job, const int capture_lines)
+{
+    nlohmann::json snapshot = job.snapshot(capture_lines);
+    const std::string state = snapshot.value("state", "unknown");
+
+    if (state == "completed") {
+        std::string text = job_text(snapshot);
+        ToolResult result = snapshot.value("julia_error", false) ? ToolResult::error(std::move(text))
+                                                                 : ToolResult::success(std::move(text));
+        return result.with_structured(std::move(snapshot));
+    }
+
+    std::ostringstream out;
+    if (state == "running") {
+        out << "Still running after " << snapshot.value("elapsed_ms", 0) << " ms. The job kept its "
+            << "marker and keeps being polled in the background.\n"
+            << "job_id: " << job.id << "\n"
+            << "Call jjmcp_wait(job_id) to keep waiting, jjmcp_job_status(job_id) for process "
+            << "activity, or jjmcp_result(job_id) once it finishes.";
+        const std::string tail = snapshot.value("live_tail", "");
+        if (!tail.empty()) {
+            out << "\nOutput so far:\n" << tail;
+        }
+        return ToolResult::success(out.str()).with_structured(std::move(snapshot));
+    }
+
+    if (state == "timed_out") {
+        out << "Timed out after " << job.timeout_ms << " ms waiting for " << job.marker.end << "\n"
+            << "job_id: " << job.id;
+        const std::string partial = snapshot.value("stdout", "");
+        if (snapshot.value("found_begin", false) && !partial.empty()) {
+            out << "\nPartial output between markers:\n" << partial;
+        }
+        return ToolResult::error(out.str()).with_structured(std::move(snapshot));
+    }
+
+    out << "Job " << job.id << " failed: " << snapshot.value("failure", "unknown error");
+    return ToolResult::error(out.str()).with_structured(std::move(snapshot));
+}
+
+} // namespace
+
+Result<std::shared_ptr<EvalJob>> ToolDispatcher::send_job(const JobRequest& request,
+                                                          const std::string& pane_pid,
+                                                          std::unique_ptr<AdvisoryLock> lock)
+{
+    using JobResultT = Result<std::shared_ptr<EvalJob>>;
+
+    auto job = std::make_shared<EvalJob>();
+    job->id = next_marker_id(state_);
+    job->marker = make_marker(job->id);
+    job->target = bound_target();
+    job->pane_pid = pane_pid;
+    job->code = request.code;
+    job->timeout_ms = request.job_ms;
+    job->capture_lines = request.capture_lines;
+    job->submitted_at = timestamp_now();
+    job->started = std::chrono::steady_clock::now();
+    job->lock = std::move(lock);
+
+    // Fast single-line prints wrap into thousands of terminal rows and can push BEGIN out of a
+    // small capture window before the first post-send poll. Keep the polling window larger than the
+    // returned capture window; the final MCP payload is capped separately.
+    const int poll_capture_lines = std::clamp(request.capture_lines + 8000, 10000, kMaxCaptureLines);
+    job->poller = std::make_unique<MarkerPoller>(tmux_, job->target, job->marker, poll_capture_lines);
+
+    const std::string buffer_name = "jjmcp_" + job->id;
+    const std::string wrapped = wrap_julia_code(request.code, job->marker, request.display_ms);
+    if (const auto sent = tmux_.send_text(job->target, wrapped, buffer_name); !sent) {
+        return JobResultT::failure(sent.error());
+    }
+    if (const auto registered = jobs_.register_running(job); !registered) {
+        return JobResultT::failure(registered.error());
+    }
+    return JobResultT::success(std::move(job));
+}
+
+Result<std::shared_ptr<EvalJob>> ToolDispatcher::start_marker_job(const JobRequest& request,
+                                                                  ProgressEmitter* progress,
+                                                                  PollOutcome& outcome)
+{
+    using JobResultT = Result<std::shared_ptr<EvalJob>>;
+
+    if (!state_.binding) {
+        return JobResultT::failure("no tmux pane is bound; call jjmcp_bind first");
+    }
+    const auto info = tmux_.pane_info(bound_target());
+    if (!info) {
+        return JobResultT::failure(info.error());
+    }
+    if (!info.value().alive()) {
+        return JobResultT::failure("bound tmux pane appears dead: " + bound_target());
+    }
+    if (const auto busy = jobs_.running_in(bound_target()); busy != nullptr) {
+        return JobResultT::failure("job " + busy->id + " is still running in " + bound_target()
+                                   + "; wait for it with jjmcp_wait, or call jjmcp_interrupt");
+    }
+
+    // Pane-mode safety: refuse to paste into a non-julia REPL mode (pkg/help/shell). Try a single
+    // backspace to exit common alternate modes, then re-check. force=true bypasses this entirely.
+    if (!request.force) {
+        const auto last = tmux_.capture_pane(bound_target(), 1);
+        if (last && is_known_non_julia_prompt(last.value())) {
+            (void)tmux_.send_key(bound_target(), "BSpace");
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            const auto recheck = tmux_.capture_pane(bound_target(), 1);
+            if (!recheck || is_known_non_julia_prompt(recheck.value())) {
+                return JobResultT::failure(
+                    std::string("bound pane appears to be in a non-julia REPL mode "
+                                "(pkg>/help?>/shell>). Last line: \"")
+                    + (recheck ? recheck.value() : last.value())
+                    + "\". Press backspace in the pane to return to julia>, or pass force=true.");
+            }
+        }
+    }
+
+    // Advisory lock against a second jjmcp process targeting the same pane. The job owns it for its
+    // whole life, so a detached job still keeps the pane reserved.
+    auto lock = std::make_unique<AdvisoryLock>(state_.config_path.parent_path() / "lock");
+    if (const auto acquired = lock->acquire(std::to_string(state_.marker_sequence + 1)); !acquired) {
+        return JobResultT::failure(acquired.error());
+    }
+
+    if (const auto runtime = ensure_jjmcp_runtime(request.job_ms, info.value().pane_pid); !runtime) {
+        return JobResultT::failure(runtime.error());
+    }
+
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        auto sent = send_job(request, info.value().pane_pid, std::move(lock));
+        if (!sent) {
+            return sent;
+        }
+        auto job = sent.value();
+
+        PollOptions options;
+        // Only the first attempt reacts to a missing runtime, so a stale error already in the
+        // scrollback cannot make the code run twice.
+        options.detect_missing_runtime = attempt == 0;
+        options.progress = progress;
+        options.cancel = &job->cancel;
+        options.on_tick = [&job](const bool grew) {
+            if (grew) {
+                job->publish_live();
+            }
+        };
+        const auto window = std::min(request.foreground_ms, request.job_ms);
+        outcome = job->poller->poll_until(job->started + std::chrono::milliseconds(window), options);
+
+        if (outcome.stop != PollStop::RuntimeMissing) {
+            return JobResultT::success(std::move(job));
+        }
+
+        // The Julia process was replaced after the runtime was injected, so the paste never ran.
+        // Reclaim the pane lock before the job drops it, then re-inject and send once more.
+        lock = std::move(job->lock);
+        job->finish(JobState::Failed, "@JJMCP_COMMAND was missing; resent after reinstalling the runtime");
+        jobs_.abandon(job);
+        log::warn("jjmcp_runtime_reinjected", {{"target", bound_target()}});
+        tmux_runtime_bootstrapped_.invalidate(bound_target());
+        if (const auto runtime = ensure_jjmcp_runtime(request.job_ms, info.value().pane_pid); !runtime) {
+            return JobResultT::failure(runtime.error());
+        }
+    }
+
+    return JobResultT::failure("the Julia REPL in " + bound_target()
+                               + " does not accept @JJMCP_COMMAND after reinstalling the runtime");
+}
+
 ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, int capture_lines,
                                      bool force, ProgressEmitter* progress_override,
-                                     const std::string& transport)
+                                     const std::string& transport, bool detach_on_timeout)
 {
     ProgressEmitter* progress = progress_override != nullptr ? progress_override : current_progress_;
     if (!state_.binding) {
         return ToolResult::error("no tmux pane is bound; call jjmcp_bind first");
     }
 
-    const auto info = tmux_.pane_info(bound_target());
-    if (!info) {
-        return ToolResult::error(info.error());
-    }
-    if (!info.value().alive()) {
-        return ToolResult::error("bound tmux pane appears dead: " + bound_target());
-    }
-
     // Transport routing: when transport is "socket" or "auto" and a JJMCPHelper.jl socket exists
     // for the bound pane, prefer that path for structured returns and millisecond-scale latency.
     // The socket path runs eval at top level via Base.include_string(Main, ...) and echoes
-    // stdout/stderr to the live REPL, so the human-visible scrollback is unchanged. With transport=tmux we always
-    // use the marker path. With transport=auto, a socket failure falls back to the marker path
-    // with a warn log; with transport=socket, a failure is returned as-is.
-    if (transport != "tmux" && state_.binding) {
+    // stdout/stderr to the live REPL, so the human-visible scrollback is unchanged. With
+    // transport=tmux we always use the marker path. With transport=auto, a socket failure falls
+    // back to the marker path with a warn log; with transport=socket, a failure is returned as-is.
+    if (transport != "tmux") {
         const std::string& pane_id = state_.binding->pane_id.empty() ? state_.binding->target : state_.binding->pane_id;
         const std::string sock_path = SocketClient::default_socket_path(pane_id);
         if (SocketClient::socket_exists(sock_path)) {
@@ -1236,247 +1433,296 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
         }
     }
 
-    // Pane-mode safety: refuse to paste into a non-julia REPL mode (pkg/help/shell). Try a single
-    // backspace to exit common alternate modes, then re-check. force=true bypasses this entirely.
-    if (!force) {
-        const auto last = tmux_.capture_pane(bound_target(), 1);
-        if (last && is_known_non_julia_prompt(last.value())) {
-            (void)tmux_.send_key(bound_target(), "BSpace");
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            const auto recheck = tmux_.capture_pane(bound_target(), 1);
-            if (!recheck || is_known_non_julia_prompt(recheck.value())) {
-                return ToolResult::error(
-                    std::string("bound pane appears to be in a non-julia REPL mode "
-                                "(pkg>/help?>/shell>). Last line: \"")
-                    + (recheck ? recheck.value() : last.value())
-                    + "\". Press backspace in the pane to return to julia>, or pass force=true.");
-            }
+    // timeout_ms bounds how long this call waits. A job that outlives that window is handed to the
+    // background poller, so its own lifetime must be longer than the wait, not equal to it.
+    JobRequest request;
+    request.code = code;
+    request.job_ms = detach_on_timeout
+                         ? std::max(timeout_ms, std::min(kDefaultJobTimeoutMs, state_.max_job_ms))
+                         : timeout_ms;
+    request.display_ms = timeout_ms;
+    request.capture_lines = capture_lines;
+    request.foreground_ms = timeout_ms;
+    request.force = force;
+
+    PollOutcome outcome;
+    auto started = start_marker_job(request, progress, outcome);
+    if (!started) {
+        return ToolResult::error(started.error());
+    }
+    auto job = started.value();
+
+    if (outcome.stop == PollStop::Pending && detach_on_timeout) {
+        // The waiting window expired but the REPL is still working. Hand the poller (and its
+        // accumulator) to a background thread so no output is lost between here and jjmcp_wait.
+        job->publish_live();
+        jobs_.detach(job);
+        return job_to_tool_result(*job, capture_lines);
+    }
+
+    finish_from_outcome(job, outcome);
+    jobs_.retire(job);
+    return job_to_tool_result(*job, capture_lines);
+}
+
+ToolResult ToolDispatcher::eval_async(const nlohmann::json& arguments)
+{
+    std::string error;
+    const std::string code = require_string(arguments, "code", error);
+    if (!error.empty()) {
+        return ToolResult::error(error);
+    }
+    const int timeout_ms = optional_int(arguments, "timeout_ms",
+                                        std::min(kDefaultJobTimeoutMs, state_.max_job_ms), 1,
+                                        state_.max_job_ms);
+    const int capture_lines = optional_int(arguments, "capture_lines", kDefaultCaptureLines, 1, kMaxCaptureLines);
+    const bool force = arguments.value("force", false);
+    const bool validate_syntax = arguments.value("validate_syntax", true);
+    if (validate_syntax) {
+        if (const auto ok = validate_julia_syntax(code); !ok) {
+            return ToolResult::error("syntax error before eval (set validate_syntax=false to skip):\n"
+                                     + ok.error());
         }
     }
 
-    // Acquire advisory lock so a second jjmcp process targeting the same pane cannot interleave
-    // its paste-buffer with ours.
-    AdvisoryLock lock(state_.config_path.parent_path() / "lock");
-    if (const auto acquired = lock.acquire(std::to_string(state_.marker_sequence + 1)); !acquired) {
-        return ToolResult::error(acquired.error());
-    }
+    JobRequest request;
+    request.code = code;
+    request.job_ms = timeout_ms;
+    request.display_ms = timeout_ms;
+    request.capture_lines = capture_lines;
+    request.foreground_ms = kJobBootstrapWindowMs;
+    request.force = force;
 
-    if (const auto runtime = ensure_jjmcp_runtime(timeout_ms, info.value().pane_pid); !runtime) {
-        return ToolResult::error(runtime.error());
+    PollOutcome outcome;
+    auto started = start_marker_job(request, nullptr, outcome);
+    if (!started) {
+        return ToolResult::error(started.error());
     }
+    auto job = started.value();
 
-    // One paste-and-wait pass. Returns nullopt when the pane REPL rejected the wrapper because the
-    // runtime macro is gone, which means the Julia process was replaced after the last injection.
-    const auto run_marker_eval = [&](bool detect_missing_runtime) -> std::optional<ToolResult> {
-        const Marker marker = make_marker(next_marker_id(state_));
-        const std::string wrapped = wrap_julia_code(code, marker, timeout_ms);
-        const std::string buffer_name = "jjmcp_" + marker.id;
-        const auto start = std::chrono::steady_clock::now();
-        const auto sent = tmux_.send_text(bound_target(), wrapped, buffer_name);
-        if (!sent) {
-            return ToolResult::error(sent.error());
+    if (outcome.stop == PollStop::Pending) {
+        job->publish_live();
+        jobs_.detach(job);
+    } else {
+        // Short work can already be finished when the bootstrap window closes.
+        finish_from_outcome(job, outcome);
+        jobs_.retire(job);
+    }
+    return job_to_tool_result(*job, capture_lines);
+}
+
+ToolResult ToolDispatcher::wait_for_job(const nlohmann::json& arguments)
+{
+    const std::string job_id = optional_string(arguments, "job_id", optional_string(arguments, "marker_id"));
+    if (job_id.empty()) {
+        return ToolResult::error("job_id is required");
+    }
+    const int timeout_ms = optional_int(arguments, "timeout_ms", kDefaultWaitMs, 1, state_.max_timeout_ms);
+    const int capture_lines = optional_int(arguments, "capture_lines", kDefaultCaptureLines, 1, kMaxCaptureLines);
+
+    if (const auto job = jobs_.find(job_id); job != nullptr) {
+        {
+            std::unique_lock<std::mutex> guard(job->mu);
+            job->cv.wait_for(guard, std::chrono::milliseconds(timeout_ms),
+                             [&job]() { return job->state != JobState::Running; });
         }
-
-        const auto deadline = start + std::chrono::milliseconds(timeout_ms);
-        // Fast single-line prints wrap into thousands of terminal rows and can push BEGIN out of a
-        // small capture window before the first post-send poll. Keep the polling window larger than
-        // the returned capture window; final MCP output is still capped separately below.
-        const int poll_capture_lines = std::clamp(capture_lines + 8000, 10000, kMaxCaptureLines);
-
-        // Adaptive polling: start at 50 ms, double when no growth, reset on growth, cap at 1000 ms.
-        // Replaces a fixed 75 ms loop that issued ~4000 capture-pane subprocesses per 5-min Pkg.test.
-        //
-        // Accumulator: each tmux capture-pane returns the last poll_capture_lines of the visible pane.
-        // We splice consecutive captures by their longest suffix-prefix overlap so output that has
-        // scrolled off the visible pane buffer (and thus is no longer in the next capture) is still
-        // preserved in the working set. Without this, a long compile log can push the BEGIN marker
-        // out of the capture window, leaving extract_between_markers().found_begin = false for an
-        // eval that actually succeeded.
-        std::chrono::milliseconds backoff{50};
-        constexpr std::chrono::milliseconds kBackoffMin{50};
-        constexpr std::chrono::milliseconds kBackoffMax{1000};
-        constexpr int kMaxCaptureFailures = 5;
-        std::string accumulator;
-        std::string last_capture;
-        ExtractedOutput last_extract;
-        bool timed_out = false;
-        bool begin_trimmed = false;
-        int capture_failures = 0;
-
-        constexpr std::size_t kProgressMinDelta = 4096;
-        constexpr std::size_t kProgressMaxTail = 4096;
-        std::size_t last_progress_size = 0;
-        int progress_count = 0;
-
-        while (true) {
-            const auto captured = tmux_.capture_pane(bound_target(), poll_capture_lines);
-            if (!captured) {
-                // A capture can fail transiently while the tmux server is under load. Losing a poll
-                // is harmless, so keep waiting and give up only on a persistent failure.
-                if (++capture_failures > kMaxCaptureFailures) {
-                    return ToolResult::error(captured.error());
-                }
-                log::warn("capture_pane_failed",
-                          {{"error", captured.error()}, {"consecutive", capture_failures}});
-                const auto now = std::chrono::steady_clock::now();
-                if (now >= deadline) {
-                    timed_out = true;
-                    break;
-                }
-                const auto wait = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-                std::this_thread::sleep_for(std::min(kBackoffMax, wait));
-                continue;
-            }
-            capture_failures = 0;
-            const std::string& cap = captured.value();
-
-            bool grew = false;
-            if (accumulator.empty()) {
-                if (!cap.empty()) {
-                    accumulator = cap;
-                    grew = true;
-                }
-            } else if (cap != last_capture) {
-                const std::size_t overlap = compute_capture_overlap(last_capture, cap);
-                if (overlap < cap.size()) {
-                    accumulator.append(cap, overlap, cap.size() - overlap);
-                    grew = true;
-                }
-            }
-            last_capture = cap;
-
-            // Prefer extracting from the live capture: it is the most authoritative source for the
-            // common small-pane / not-yet-scrolled case and is immune to any imprecision in the
-            // accumulator splice. If BEGIN has already scrolled off the live capture, fall back to
-            // the accumulator, which retains everything since the first capture that saw BEGIN.
-            last_extract = extract_between_markers(cap, marker);
-            if (!last_extract.found_begin) {
-                last_extract = extract_between_markers(accumulator, marker);
-            }
-
-            if (detect_missing_runtime && !last_extract.found_begin
-                && jjmcp_runtime_missing(cap, marker.id)) {
-                return std::nullopt;
-            }
-
-            // Once BEGIN is located anywhere, discard all pre-BEGIN pane history from the accumulator.
-            // Future extraction passes only need to scan from BEGIN onward, keeping the working set
-            // bounded by actual output size rather than total pane history.
-            if (!begin_trimmed && last_extract.found_begin) {
-                const auto begin_pos = accumulator.find(marker.begin);
-                if (begin_pos != std::string::npos) {
-                    const auto line_start = accumulator.rfind('\n', begin_pos);
-                    const std::size_t trim_to = (line_start == std::string::npos) ? 0 : line_start + 1;
-                    if (trim_to > 0) {
-                        accumulator.erase(0, trim_to);
-                    }
-                }
-                begin_trimmed = true;
-            }
-
-            // Emit a progress notification when the in-progress output between markers grows by at
-            // least kProgressMinDelta bytes. Cap the tail per notification to avoid megabyte frames
-            // when a large value is printed all at once.
-            if (progress != nullptr && progress->active() && last_extract.found_begin) {
-                const std::size_t cur = last_extract.text.size();
-                if (cur >= last_progress_size + kProgressMinDelta) {
-                    const std::string tail =
-                        truncate_bytes_tail(last_extract.text.substr(last_progress_size), kProgressMaxTail);
-                    ++progress_count;
-                    progress->emit(static_cast<double>(progress_count), tail);
-                    last_progress_size = cur;
-                }
-            }
-
-            if (!last_extract.found_end && accumulator.size() > kMaxEvalAccumulatorBytes) {
-                if (last_extract.found_begin) {
-                    const bool saw_out_end = accumulator.find(marker.out_end) != std::string::npos;
-                    const bool saw_val_end = accumulator.find(marker.val_end) != std::string::npos;
-                    const bool saw_error = accumulator.find(marker.error) != std::string::npos;
-                    const bool saw_backtrace = accumulator.find(marker.bt) != std::string::npos;
-                    const bool saw_end = accumulator.find(marker.end) != std::string::npos;
-                    accumulator = compact_marker_accumulator(last_extract, marker, saw_out_end,
-                                                             saw_val_end, saw_error, saw_backtrace,
-                                                             saw_end);
-                    last_extract = extract_between_markers(accumulator, marker);
-                    last_progress_size = 0;
-                } else {
-                    // BEGIN is in no capture we have seen, so nothing in the head can be recovered.
-                    // Drop it: the working set must stay bounded however much the pane prints.
-                    const std::size_t drop = accumulator.size() - kMaxEvalAccumulatorBytes / 2;
-                    const auto line_end = accumulator.find('\n', drop);
-                    accumulator.erase(0, line_end == std::string::npos ? drop : line_end + 1);
-                }
-            }
-
-            if (last_extract.found_end) {
-                break;
-            }
-
-            const auto now = std::chrono::steady_clock::now();
-            if (now >= deadline) {
-                timed_out = true;
-                break;
-            }
-
-            backoff = grew ? kBackoffMin : std::min(backoff * 2, kBackoffMax);
-            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-            std::this_thread::sleep_for(std::min(backoff, remaining));
-        }
-
-        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - start).count();
-
-        const auto cap_lines = static_cast<std::size_t>(capture_lines);
-        nlohmann::json structured = {
-            {"elapsed_ms", elapsed},
-            {"timed_out", timed_out},
-            {"found_begin", last_extract.found_begin},
-            {"found_end", last_extract.found_end},
-            {"julia_error", last_extract.julia_error},
-            {"marker_id", marker.id},
-            {"stdout",        truncate_tool_tail(last_extract.stdout_text,    cap_lines)},
-            {"value_repr",    truncate_tool_tail(last_extract.value_repr,     cap_lines)},
-            {"error_message", truncate_tool_tail(last_extract.error_message,  cap_lines)},
-            {"backtrace",     truncate_tool_tail(last_extract.backtrace,      200, kMaxMcpBacktraceBytes)},
-            {"transport", "tmux"},
-        };
-
-        if (!timed_out) {
-            auto text = truncate_tool_tail(last_extract.text, cap_lines);
-            ToolResult result = last_extract.julia_error ? ToolResult::error(std::move(text))
-                                                         : ToolResult::success(std::move(text));
-            return result.with_structured(std::move(structured));
-        }
-
-        std::ostringstream out;
-        out << "Timed out after " << timeout_ms << " ms waiting for " << marker.end;
-        if (last_extract.found_begin && !last_extract.text.empty()) {
-            out << "\nPartial output between markers:\n";
-            out << truncate_tool_tail(last_extract.text, cap_lines);
-        } else if (!last_capture.empty()) {
-            out << "\nRecent pane output:\n";
-            out << truncate_tool_tail(last_capture, static_cast<std::size_t>(std::min(capture_lines, 200)));
-        }
-        return ToolResult::error(out.str()).with_structured(std::move(structured));
-    };
-
-    if (auto result = run_marker_eval(true); result) {
-        return std::move(*result);
+        return job_to_tool_result(*job, capture_lines);
     }
 
-    // The Julia process in the pane was replaced after the runtime was injected. Re-inject and
-    // retry once; the retry ignores the detection so a stale error in the scrollback cannot loop.
-    log::warn("jjmcp_runtime_reinjected", {{"target", bound_target()}});
-    tmux_runtime_bootstrapped_.invalidate(bound_target());
-    if (const auto runtime = ensure_jjmcp_runtime(timeout_ms, info.value().pane_pid); !runtime) {
-        return ToolResult::error(runtime.error());
+    if (auto persisted = jobs_.load_persisted(job_id); persisted) {
+        return persisted_job_result(*persisted);
     }
-    if (auto result = run_marker_eval(false); result) {
-        return std::move(*result);
+
+    // The marker belongs to no job this process tracks: it came from an earlier jjmcp, or from a
+    // synchronous eval whose result was never claimed. Rebuild the marker from its id and read the
+    // pane. Whatever has already scrolled out of the tmux history is not recoverable this way.
+    if (!state_.binding) {
+        return ToolResult::error("no job " + job_id + " and no bound pane to recover it from");
     }
-    return ToolResult::error("the Julia REPL in " + bound_target()
-                             + " does not accept @JJMCP_COMMAND after reinstalling the runtime");
+    auto job = std::make_shared<EvalJob>();
+    job->id = job_id;
+    job->marker = make_marker(job_id);
+    job->target = bound_target();
+    job->timeout_ms = timeout_ms;
+    job->capture_lines = capture_lines;
+    job->submitted_at = timestamp_now();
+    job->started = std::chrono::steady_clock::now();
+    const int poll_capture_lines = std::clamp(capture_lines + 8000, 10000, kMaxCaptureLines);
+    job->poller = std::make_unique<MarkerPoller>(tmux_, job->target, job->marker, poll_capture_lines);
+
+    PollOptions options;
+    options.progress = current_progress_;
+    const auto outcome = job->poller->poll_until(
+        job->started + std::chrono::milliseconds(timeout_ms), options);
+    finish_from_outcome(job, outcome);
+
+    ToolResult result = job_to_tool_result(*job, capture_lines);
+    result.structured["recovered_from_scrollback"] = true;
+    return result;
+}
+
+ToolResult ToolDispatcher::job_status(const nlohmann::json& arguments) const
+{
+    const std::string job_id = optional_string(arguments, "job_id", optional_string(arguments, "marker_id"));
+    const int capture_lines = optional_int(arguments, "capture_lines", kDefaultStatusLines, 1, kMaxCaptureLines);
+
+    const auto job = job_id.empty() ? jobs_.most_recent() : jobs_.find(job_id);
+    if (job == nullptr) {
+        if (!job_id.empty()) {
+            if (auto persisted = jobs_.load_persisted(job_id); persisted) {
+                return persisted_job_result(*persisted);
+            }
+            return ToolResult::error("unknown job: " + job_id);
+        }
+        return ToolResult::error("no jobs have run in this jjmcp process");
+    }
+
+    nlohmann::json structured = job->snapshot(capture_lines);
+
+    // Process activity is read from /proc, so it stays available while Julia itself is too busy to
+    // answer. The foreground process group of the pane terminal is the REPL running there.
+    const long long repl_pid = pane_foreground_pid(job->pane_pid);
+    const ProcStats stats = read_proc_stats(repl_pid);
+    structured["pane_pid"] = job->pane_pid;
+    structured["repl_pid"] = repl_pid;
+    structured["proc_available"] = stats.available;
+    if (stats.available) {
+        structured["proc_state"] = stats.state;
+        structured["cpu_seconds"] = stats.cpu_seconds;
+        structured["rss_bytes"] = stats.rss_bytes;
+        structured["threads"] = stats.threads;
+    }
+    if (const auto info = tmux_.pane_info(job->target); info) {
+        structured["pane_alive"] = info.value().alive();
+        structured["pane_current_command"] = info.value().current_command;
+    }
+
+    std::ostringstream out;
+    out << "job_id: " << job->id << '\n';
+    out << "state: " << structured.value("state", "unknown") << '\n';
+    out << "target: " << job->target << '\n';
+    out << "elapsed_ms: " << structured.value("elapsed_ms", 0) << '\n';
+    out << "output_bytes: " << structured.value("output_bytes", 0) << '\n';
+    if (structured.contains("last_output_age_ms")) {
+        out << "last_output_age_ms: " << structured.value("last_output_age_ms", 0) << '\n';
+    }
+    if (stats.available) {
+        out << "repl_pid: " << repl_pid << " (" << stats.state << ")\n";
+        out << "cpu_seconds: " << stats.cpu_seconds << '\n';
+        out << "rss_bytes: " << stats.rss_bytes << '\n';
+    } else {
+        out << "repl process stats unavailable\n";
+    }
+    if (const std::string failure = structured.value("failure", ""); !failure.empty()) {
+        out << "failure: " << failure << '\n';
+    }
+    return ToolResult::success(out.str()).with_structured(std::move(structured));
+}
+
+ToolResult ToolDispatcher::job_result(const nlohmann::json& arguments) const
+{
+    const std::string job_id = optional_string(arguments, "job_id", optional_string(arguments, "marker_id"));
+    if (job_id.empty()) {
+        return ToolResult::error("job_id is required");
+    }
+    const int capture_lines = optional_int(arguments, "capture_lines", kDefaultCaptureLines, 1, kMaxCaptureLines);
+
+    if (const auto job = jobs_.find(job_id); job != nullptr) {
+        return job_to_tool_result(*job, capture_lines);
+    }
+    if (auto persisted = jobs_.load_persisted(job_id); persisted) {
+        return persisted_job_result(*persisted);
+    }
+    return ToolResult::error("unknown job: " + job_id
+                             + " (it is not in this process and no stored result exists; "
+                               "call jjmcp_wait to recover the marker from the pane)");
+}
+
+ToolResult ToolDispatcher::capture_job(const nlohmann::json& arguments) const
+{
+    const std::string job_id = optional_string(arguments, "job_id", optional_string(arguments, "marker_id"));
+    if (job_id.empty()) {
+        return ToolResult::error("job_id is required");
+    }
+    const int lines = optional_int(arguments, "lines", kDefaultCaptureLines, 1, kMaxCaptureLines);
+
+    const auto job = jobs_.find(job_id);
+    if (job == nullptr) {
+        if (auto persisted = jobs_.load_persisted(job_id); persisted) {
+            const std::string text = truncate_tool_tail(persisted->value("text", ""),
+                                                        static_cast<std::size_t>(lines));
+            return ToolResult::success(text).with_structured(
+                {{"job_id", job_id}, {"state", persisted->value("state", "unknown")}, {"text", text}});
+        }
+        return ToolResult::error("unknown job: " + job_id);
+    }
+
+    std::string text;
+    std::string state;
+    std::size_t output_bytes = 0;
+    {
+        std::lock_guard<std::mutex> guard(job->mu);
+        state = job_state_name(job->state);
+        output_bytes = job->output_bytes;
+        text = truncate_tool_tail(job->state == JobState::Running ? job->live_tail : job->result.text,
+                                  static_cast<std::size_t>(lines));
+    }
+    return ToolResult::success(text).with_structured({
+        {"job_id", job->id},
+        {"marker_id", job->marker.id},
+        {"state", state},
+        {"target", job->target},
+        {"output_bytes", output_bytes},
+        {"lines", lines},
+        {"text", text},
+    });
+}
+
+ToolResult ToolDispatcher::list_jobs() const
+{
+    nlohmann::json entries = nlohmann::json::array();
+    std::ostringstream out;
+    for (const auto& job : jobs_.list()) {
+        nlohmann::json entry = job->snapshot(1);
+        entry.erase("stdout");
+        entry.erase("value_repr");
+        entry.erase("error_message");
+        entry.erase("backtrace");
+        entry.erase("live_tail");
+        entry["code_preview"] = truncate_bytes_tail(truncate_lines(job->code, 3), 300);
+        out << entry.value("state", "unknown") << "  " << job->id << "  " << job->target << "  "
+            << entry.value("elapsed_ms", 0) << " ms\n";
+        entries.push_back(std::move(entry));
+    }
+    if (entries.empty()) {
+        return ToolResult::success("no jobs in this jjmcp process")
+            .with_structured({{"jobs", entries}});
+    }
+    return ToolResult::success(out.str()).with_structured({{"jobs", std::move(entries)}});
+}
+
+bool ToolDispatcher::is_control_plane_tool(const std::string& name)
+{
+    return name == "jjmcp_job_status" || name == "jjmcp_result" || name == "jjmcp_capture_job"
+        || name == "jjmcp_list_jobs";
+}
+
+ToolResult ToolDispatcher::call_control_plane(const std::string& name,
+                                              const nlohmann::json& arguments) const
+{
+    if (name == "jjmcp_job_status") {
+        return job_status(arguments);
+    }
+    if (name == "jjmcp_result") {
+        return job_result(arguments);
+    }
+    if (name == "jjmcp_capture_job") {
+        return capture_job(arguments);
+    }
+    if (name == "jjmcp_list_jobs") {
+        return list_jobs();
+    }
+    return ToolResult::error("unknown tool: " + name);
 }
 
 namespace {

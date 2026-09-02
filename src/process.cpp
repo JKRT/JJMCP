@@ -123,6 +123,10 @@ Result<ProcessResult> ProcessRunner::run(const RunSpec& spec) const
         }
     }
 
+    // argv must be materialized before the fork: the child may only call async-signal-safe
+    // functions, and background pollers fork concurrently with the worker thread.
+    auto exec_argv = make_exec_argv(spec.argv);
+
     const pid_t pid = ::fork();
     if (pid < 0) {
         ::close(stdout_pipe[0]);
@@ -152,10 +156,9 @@ Result<ProcessResult> ProcessRunner::run(const RunSpec& spec) const
             ::close(stdin_pipe[1]);
         }
 
-        auto exec_argv = make_exec_argv(spec.argv);
         ::execvp(exec_argv[0], exec_argv.data());
-        const std::string message = "execvp failed: " + std::string(std::strerror(errno)) + "\n";
-        const ssize_t ignored = ::write(STDERR_FILENO, message.data(), message.size());
+        static constexpr char kExecFailed[] = "execvp failed\n";
+        const ssize_t ignored = ::write(STDERR_FILENO, kExecFailed, sizeof(kExecFailed) - 1);
         (void)ignored;
         _exit(127);
     }

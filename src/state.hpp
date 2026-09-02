@@ -25,6 +25,9 @@ struct ServerState {
     // Per-process upper bound on tool timeout_ms. Overridable via JJMCP_TIMEOUT_MS_MAX env var.
     // Default matches the original compile-time clamp of 600000 ms (10 min).
     int max_timeout_ms = 600000;
+    // Upper bound on a detached job's lifetime. A job blocks no MCP call, so it is bounded
+    // separately and far more loosely. Overridable via JJMCP_JOB_MS_MAX.
+    int max_job_ms = 86400000;
 };
 
 std::filesystem::path default_config_path(const std::filesystem::path& base);

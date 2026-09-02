@@ -169,7 +169,12 @@ std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request
         // A throwing tool call must not reach the worker thread: an escaped exception terminates the
         // process and the client sees the transport close.
         try {
-            const auto result = tools.call(params["name"], arguments, &emitter);
+            const std::string name = params["name"];
+            // Control-plane tools read only the job store, so they are safe on either thread and
+            // must not touch the dispatcher state the worker owns.
+            const auto result = ToolDispatcher::is_control_plane_tool(name)
+                                    ? tools.call_control_plane(name, arguments)
+                                    : tools.call(name, arguments, &emitter);
             return make_jsonrpc_result(id, tool_result_json(result));
         } catch (const std::exception& e) {
             return make_jsonrpc_error(id, -32603, std::string("tool call failed: ") + e.what());

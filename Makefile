@@ -23,6 +23,7 @@ CPPFLAGS += $(JSON_CFLAGS)
 LDLIBS += $(JSON_LIBS)
 
 LIB_SRCS := \
+	$(SRC_DIR)/jobs.cpp \
 	$(SRC_DIR)/julia_wrap.cpp \
 	$(SRC_DIR)/log.cpp \
 	$(SRC_DIR)/mcp.cpp \
@@ -85,6 +86,7 @@ test-integration: $(BUILD_DIR)/jjmcp
 	@./tests/integration/test_tmux_fixture.sh
 	@./tests/integration/test_repl_restart.sh
 	@./tests/integration/test_socket_fixture.sh
+	@./tests/integration/test_async_jobs.sh
 
 install: $(BUILD_DIR)/jjmcp
 	$(INSTALL) -d "$(DESTDIR)$(BINDIR)"

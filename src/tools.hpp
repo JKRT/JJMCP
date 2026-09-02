@@ -1,5 +1,6 @@
 #pragma once
 
+#include "jobs.hpp"
 #include "progress.hpp"
 #include "socket_client.hpp"
 #include "state.hpp"
@@ -62,6 +63,18 @@ private:
 // Empty when it cannot be read.
 std::string pane_foreground_generation(const std::string& pane_pid);
 
+// One submission to the bound REPL. The two timeouts are deliberately separate: job_ms bounds the
+// job itself, foreground_ms bounds only how long the calling thread waits before handing the job to
+// the background poller, and display_ms is the number pasted into the pane for the human to read.
+struct JobRequest {
+    std::string code;
+    int job_ms = 0;
+    int display_ms = 0;
+    int capture_lines = 0;
+    int foreground_ms = 0;
+    bool force = false;
+};
+
 class ToolDispatcher {
 public:
     ToolDispatcher(ServerState& state, const Tmux& tmux, std::filesystem::path cwd);
@@ -69,6 +82,15 @@ public:
     nlohmann::json list_tools_json() const;
     ToolResult call(const std::string& name, const nlohmann::json& arguments,
                     ProgressEmitter* progress = nullptr);
+
+    // Job tools that answer from the job store alone. They never touch the binding, the marker
+    // sequence or the runtime cache, so the read thread can serve them while the worker thread sits
+    // inside a long evaluation. That is what keeps process activity observable while Julia is busy.
+    static bool is_control_plane_tool(const std::string& name);
+    ToolResult call_control_plane(const std::string& name, const nlohmann::json& arguments) const;
+
+    // Cancels every background poller and joins its thread.
+    void shutdown();
 
     // Resources: read-only views over the bound project's Project.toml and Manifest.toml. URIs are
     // of the form jjmcp://project/<file>. Returns an empty list if no pane is bound or the project
@@ -88,10 +110,24 @@ private:
     ToolResult activate(const nlohmann::json& arguments);
     ToolResult test(const nlohmann::json& arguments);
     ToolResult pkg_status(const nlohmann::json& arguments);
+    ToolResult eval_async(const nlohmann::json& arguments);
+    ToolResult wait_for_job(const nlohmann::json& arguments);
+    ToolResult job_status(const nlohmann::json& arguments) const;
+    ToolResult job_result(const nlohmann::json& arguments) const;
+    ToolResult capture_job(const nlohmann::json& arguments) const;
+    ToolResult list_jobs() const;
 
     ToolResult eval_code(const std::string& code, int timeout_ms, int capture_lines,
                          bool force = false, ProgressEmitter* progress = nullptr,
-                         const std::string& transport = "auto");
+                         const std::string& transport = "auto", bool detach_on_timeout = true);
+    // Paste the wrapper and register the resulting job. Takes ownership of the pane lock.
+    Result<std::shared_ptr<EvalJob>> send_job(const JobRequest& request, const std::string& pane_pid,
+                                              std::unique_ptr<AdvisoryLock> lock);
+    // Full submit path: pane checks, pane lock, runtime bootstrap, paste, and a foreground poll of
+    // at most request.foreground_ms. `outcome` reports why that poll stopped.
+    Result<std::shared_ptr<EvalJob>> start_marker_job(const JobRequest& request,
+                                                      ProgressEmitter* progress,
+                                                      PollOutcome& outcome);
     Result<void> ensure_jjmcp_runtime(int timeout_ms, const std::string& pane_pid);
     std::string bound_target() const;
 
@@ -102,6 +138,7 @@ private:
     // progress notifications. Null if the client did not pass a progressToken.
     ProgressEmitter* current_progress_ = nullptr;
     RuntimeBootstrapCache tmux_runtime_bootstrapped_;
+    JobStore jobs_;
 };
 
 } // namespace jjmcp

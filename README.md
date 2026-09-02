@@ -40,6 +40,11 @@ build/jjmcp serve
 
 `serve` runs MCP JSON-RPC over stdio. During MCP mode, stdout is reserved for MCP frames only; diagnostics go to stderr.
 
+Two environment variables bound how long work may run. `JJMCP_TIMEOUT_MS_MAX` caps a tool's
+`timeout_ms`, which is how long one MCP call waits (default 600000). `JJMCP_JOB_MS_MAX` caps a
+detached job's lifetime, which blocks no MCP call and is therefore bounded far more loosely
+(default 86400000).
+
 ## Install
 
 ```sh
@@ -122,6 +127,8 @@ From an MCP client:
 1. Call `jjmcp_list_tmux` to find the Julia pane id, such as `%3`.
 2. Call `jjmcp_bind` with `{"target":"%3","project_root":"/path/to/project"}`.
 3. Call `jjmcp_eval` with Julia code, for example `{"code":"1 + 1"}`.
+4. For work that runs longer than a client is willing to wait, call `jjmcp_eval_async` and follow it
+   with `jjmcp_wait`.
 
 Bindings are stored in memory and persisted to `.jjmcp/config.json` under the supplied `project_root`, or under the server current directory if no project root is supplied.
 
@@ -182,12 +189,54 @@ state, and Revise state remain part of the bound Julia session. Non-eval MCP too
 `jjmcp_bind`, `jjmcp_status`, `jjmcp_capture`, and `jjmcp_interrupt` do not paste Julia code and
 therefore do not appear as `@JJMCP_COMMAND` calls.
 
+## Asynchronous, Recoverable Evaluation
+
+A long Julia command outlives the MCP call that started it. JJMCP tracks it as a **job** so the
+result is never lost when a client times out or reconnects.
+
+The job id is the marker id, and everything is addressed by it:
+
+```
+job = jjmcp_eval_async({"code": "run_long_benchmark()"})
+jjmcp_wait({"job_id": job.job_id, "timeout_ms": 60000})
+jjmcp_job_status({"job_id": job.job_id})
+jjmcp_result({"job_id": job.job_id})
+```
+
+Three properties make this recoverable:
+
+1. A background thread keeps polling the marker and owns the capture accumulator, so output that
+   scrolls out of the tmux pane is still held by JJMCP.
+2. `jjmcp_job_status`, `jjmcp_result`, `jjmcp_capture_job`, and `jjmcp_list_jobs` are answered from
+   the job store on the read thread. They report process activity while Julia is busy and while the
+   worker thread is inside another evaluation.
+3. Completed results are written to `.jjmcp/jobs/<job_id>.json`, bounded to the newest 32 records, so
+   a result survives eviction, a client reconnect, and a jjmcp restart.
+
+`jjmcp_eval` no longer fails when only its waiting window expires. By default it hands the run to the
+background poller and returns `state: "running"` with a `job_id`, which you then pass to
+`jjmcp_wait`. Set `detach_on_timeout: false` for the old error-on-timeout behaviour.
+
+`jjmcp_wait` also accepts a marker id that this process never tracked, including one from an earlier
+jjmcp. It reads the stored result first, then falls back to the pane scrollback and reports
+`recovered_from_scrollback: true`. Scrollback recovery can only return what tmux still holds.
+
+One job runs per pane at a time. A second submit is refused while a job is in flight.
+
 ## Tools
 
 - `jjmcp_list_tmux`: list sessions, windows, panes, pane ids, process names, titles, and paths.
 - `jjmcp_bind`: bind to an existing tmux pane.
 - `jjmcp_status`: report binding and pane liveness.
-- `jjmcp_eval`: evaluate Julia code in the bound pane using `@JJMCP_COMMAND`.
+- `jjmcp_eval`: evaluate Julia code in the bound pane using `@JJMCP_COMMAND`. On timeout it detaches
+  the run and returns `state: "running"` with a `job_id` unless `detach_on_timeout` is `false`.
+- `jjmcp_eval_async`: submit Julia code and return a `job_id` at once. The tmux marker path only.
+- `jjmcp_wait`: wait for a job or marker id to finish, without resending the code.
+- `jjmcp_job_status`: state, elapsed time, last-output age, and the REPL pid, cpu seconds and RSS
+  read from `/proc`.
+- `jjmcp_result`: fetch a job result from memory or from the on-disk result store.
+- `jjmcp_capture_job`: return the output of one job by marker instead of the last N pane lines.
+- `jjmcp_list_jobs`: list the jobs this jjmcp process tracks.
 - `jjmcp_capture`: capture recent output without sending input.
 - `jjmcp_interrupt`: send Ctrl-C to the bound pane.
 - `jjmcp_revise`: run `using Revise; Revise.revise()` through `@JJMCP_COMMAND`.
@@ -209,8 +258,16 @@ JJMCP_TIMEOUT_MS_MAX=14400000 build/jjmcp serve
 ```
 
 That example allows calls up to four hours when the client passes a matching `timeout_ms`.
+
+Raising the ceiling is rarely the right answer now. A run that outlives its waiting window is handed
+to the background poller instead of failing, so the better pattern for long work is a short
+`timeout_ms` plus `jjmcp_wait`. A detached job blocks no MCP call and is bounded separately by
+`JJMCP_JOB_MS_MAX` (default 86400000 ms).
+
 Oversized eval output is returned from the end of the captured output, with a truncation marker for
 omitted earlier lines or bytes. The full output remains visible in the bound tmux pane scrollback.
+Use `jjmcp_capture_job` rather than `jjmcp_capture` for a long run: it returns that job's own output
+by marker, so unrelated pane traffic cannot appear in the result.
 
 ## Notes
 

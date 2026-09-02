@@ -1,11 +1,15 @@
+#include "jobs.hpp"
 #include "julia_wrap.hpp"
 #include "mcp.hpp"
 #include "socket_client.hpp"
 #include "tmux.hpp"
 #include "tools.hpp"
 
+#include <chrono>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -315,6 +319,145 @@ void test_pane_foreground_generation()
           "generation for a live pid is prefixed with that pid");
 }
 
+std::shared_ptr<jjmcp::EvalJob> make_test_job(const std::string& id, const std::string& target)
+{
+    auto job = std::make_shared<jjmcp::EvalJob>();
+    job->id = id;
+    job->marker = jjmcp::make_marker(id);
+    job->target = target;
+    job->code = "1 + 1";
+    job->timeout_ms = 1000;
+    job->submitted_at = jjmcp::timestamp_now();
+    job->started = std::chrono::steady_clock::now();
+    return job;
+}
+
+void test_truncate_tool_tail()
+{
+    const auto tail = jjmcp::truncate_tool_tail("keep_one\nkeep_two\nkeep_three\nkeep_four\n", 2);
+    check(tail.find("keep_four") != std::string::npos, "tool tail keeps the newest line");
+    check(tail.find("keep_one") == std::string::npos, "tool tail drops the oldest line");
+}
+
+void test_read_proc_stats()
+{
+    using jjmcp::read_proc_stats;
+
+    check(!read_proc_stats(0).available, "proc stats unavailable for pid 0");
+    check(!read_proc_stats(-1).available, "proc stats unavailable for a negative pid");
+
+    const auto self = read_proc_stats(static_cast<long long>(::getpid()));
+    check(self.available, "proc stats available for the test process");
+    check(self.rss_bytes > 0, "proc stats report a non-zero RSS");
+    check(self.cpu_seconds >= 0.0, "proc stats report cpu seconds");
+    check(self.threads >= 1, "proc stats report at least one thread");
+    check(!self.state.empty(), "proc stats report a process state");
+}
+
+void test_pane_foreground_pid()
+{
+    using jjmcp::pane_foreground_pid;
+
+    check(pane_foreground_pid("") == 0, "foreground pid is zero for an empty pid");
+    check(pane_foreground_pid("bash") == 0, "foreground pid is zero for a non-numeric pid");
+    check(pane_foreground_pid("2147483646") == 0, "foreground pid is zero for an unused pid");
+}
+
+void test_job_store_lifecycle()
+{
+    const auto dir = std::filesystem::temp_directory_path()
+                     / ("jjmcp-jobs-" + std::to_string(static_cast<long long>(::getpid())));
+    std::filesystem::remove_all(dir);
+    jjmcp::JobStore store(dir);
+
+    auto first = make_test_job("job_one", "%1");
+    check(store.register_running(first).ok(), "first job registers");
+    check(store.find("job_one") == first, "registered job is retrievable by id");
+    check(store.running_in("%1") == first, "registered job occupies its pane");
+    check(store.most_recent() == first, "most recent job is the one just registered");
+
+    auto second = make_test_job("job_two", "%1");
+    check(!store.register_running(second).ok(), "a second job in the same pane is refused");
+
+    auto other_pane = make_test_job("job_three", "%2");
+    check(store.register_running(other_pane).ok(), "a job in another pane is accepted");
+
+    first->finish(jjmcp::JobState::Completed, {});
+    check(store.running_in("%1") == nullptr, "a finished job frees its pane");
+    check(store.register_running(second).ok(), "the pane accepts a new job once the old one ends");
+
+    check(store.list().size() == 3, "the store lists every tracked job");
+    store.abandon(second);
+    check(store.find("job_two") == nullptr, "an abandoned job leaves no record");
+    check(store.running_in("%1") == nullptr, "an abandoned job frees its pane");
+
+    std::filesystem::remove_all(dir);
+}
+
+void test_job_snapshot_and_persistence()
+{
+    const auto dir = std::filesystem::temp_directory_path()
+                     / ("jjmcp-persist-" + std::to_string(static_cast<long long>(::getpid())));
+    std::filesystem::remove_all(dir);
+    jjmcp::JobStore store(dir);
+
+    auto job = make_test_job("persist_one", "%9");
+    check(store.register_running(job).ok(), "job registers before it runs");
+
+    const auto running = job->snapshot(100);
+    check(running.value("state", "") == "running", "a fresh job reports state=running");
+    check(running.value("job_id", "") == "persist_one", "snapshot carries the job id");
+    check(running.value("marker_id", "") == "persist_one", "job id and marker id are the same value");
+    check(running.contains("live_tail"), "a running job exposes a live tail");
+
+    job->finish(jjmcp::JobState::Completed, {});
+    const auto done = job->snapshot(100);
+    check(done.value("state", "") == "completed", "a finished job reports state=completed");
+    check(!done.contains("live_tail"), "a finished job drops the live tail");
+
+    store.retire(job);
+    const auto stored = store.load_persisted("persist_one");
+    check(stored.has_value(), "a retired job is written to the result store");
+    if (stored) {
+        check(stored->value("job_id", "") == "persist_one", "the stored record keeps the job id");
+        check(stored->value("state", "") == "completed", "the stored record keeps the final state");
+        check(stored->contains("text"), "the stored record keeps the output text");
+    }
+    check(!store.load_persisted("../escape").has_value(), "a path-traversing job id is rejected");
+    check(!store.load_persisted("never_ran").has_value(), "an unknown job id has no stored result");
+
+    std::filesystem::remove_all(dir);
+}
+
+void test_job_failure_state()
+{
+    auto job = make_test_job("failed_one", "%3");
+    jjmcp::finish_from_outcome(job, {jjmcp::PollStop::RuntimeMissing, {}});
+    const auto snapshot = job->snapshot(10);
+    check(snapshot.value("state", "") == "failed", "a missing runtime fails the job");
+    check(snapshot.value("failure", "").find("@JJMCP_COMMAND") != std::string::npos,
+          "the failure names the missing macro");
+
+    auto timed = make_test_job("timed_one", "%4");
+    jjmcp::finish_from_outcome(timed, {jjmcp::PollStop::Pending, {}});
+    check(timed->snapshot(10).value("state", "") == "timed_out",
+          "a poller that reaches its deadline times the job out");
+    check(timed->snapshot(10).value("timed_out", false), "a timed out job sets timed_out");
+}
+
+void test_control_plane_tool_names()
+{
+    using jjmcp::ToolDispatcher;
+    check(ToolDispatcher::is_control_plane_tool("jjmcp_job_status"), "job status is control plane");
+    check(ToolDispatcher::is_control_plane_tool("jjmcp_result"), "result is control plane");
+    check(ToolDispatcher::is_control_plane_tool("jjmcp_capture_job"), "capture_job is control plane");
+    check(ToolDispatcher::is_control_plane_tool("jjmcp_list_jobs"), "list_jobs is control plane");
+    // These drive the REPL, so they must stay on the worker thread.
+    check(!ToolDispatcher::is_control_plane_tool("jjmcp_eval"), "eval is not control plane");
+    check(!ToolDispatcher::is_control_plane_tool("jjmcp_eval_async"), "eval_async is not control plane");
+    check(!ToolDispatcher::is_control_plane_tool("jjmcp_wait"), "wait is not control plane");
+}
+
 void test_encode_mcp_frame_tolerates_invalid_utf8()
 {
     nlohmann::json message = {
@@ -354,6 +497,13 @@ int main()
     test_runtime_bootstrap_cache();
     test_pane_foreground_generation();
     test_encode_mcp_frame_tolerates_invalid_utf8();
+    test_truncate_tool_tail();
+    test_read_proc_stats();
+    test_pane_foreground_pid();
+    test_job_store_lifecycle();
+    test_job_snapshot_and_persistence();
+    test_job_failure_state();
+    test_control_plane_tool_names();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

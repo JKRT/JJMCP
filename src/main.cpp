@@ -31,25 +31,34 @@ void print_usage()
         << "\n"
         << "Environment:\n"
         << "  JJMCP_TIMEOUT_MS_MAX  Override the per-tool timeout_ms upper bound (default 600000).\n"
+        << "  JJMCP_JOB_MS_MAX      Override the detached-job lifetime bound (default 86400000).\n"
         << "  JJMCP_LOG_FORMAT      Set to 'json' for one-JSON-object-per-line stderr logs (default 'text').\n";
+}
+
+void apply_ms_override(const char* name, int& target)
+{
+    const char* env = std::getenv(name);
+    if (env == nullptr) {
+        return;
+    }
+    try {
+        const int parsed = std::stoi(env);
+        if (parsed > 0) {
+            target = parsed;
+            return;
+        }
+        jjmcp::log::warn("env_override_ignored",
+                         {{"name", name}, {"value", env}, {"reason", "must be a positive integer"}});
+    } catch (const std::exception&) {
+        jjmcp::log::warn("env_override_ignored",
+                         {{"name", name}, {"value", env}, {"reason", "could not parse as integer"}});
+    }
 }
 
 void apply_env_overrides(jjmcp::ServerState& state)
 {
-    if (const char* env = std::getenv("JJMCP_TIMEOUT_MS_MAX")) {
-        try {
-            const int parsed = std::stoi(env);
-            if (parsed > 0) {
-                state.max_timeout_ms = parsed;
-            } else {
-                jjmcp::log::warn("env_override_ignored",
-                                 {{"name", "JJMCP_TIMEOUT_MS_MAX"}, {"value", env}, {"reason", "must be a positive integer"}});
-            }
-        } catch (const std::exception&) {
-            jjmcp::log::warn("env_override_ignored",
-                             {{"name", "JJMCP_TIMEOUT_MS_MAX"}, {"value", env}, {"reason", "could not parse as integer"}});
-        }
-    }
+    apply_ms_override("JJMCP_TIMEOUT_MS_MAX", state.max_timeout_ms);
+    apply_ms_override("JJMCP_JOB_MS_MAX", state.max_job_ms);
 }
 
 int serve()
@@ -99,9 +108,20 @@ int serve()
     // bound REPL behind it) is only ever driven by one thread, and so a long-running tool call never
     // blocks the read loop. Transport-level methods (ping, initialize, notifications) are handled
     // inline on the read thread, keeping keepalive responsive while the worker is busy.
-    const auto needs_worker = [](const std::string& method) {
-        return method == "tools/call" || method == "tools/list"
-            || method == "resources/list" || method == "resources/read";
+    const auto needs_worker = [](const nlohmann::json& request, const std::string& method) {
+        if (method == "tools/call") {
+            // Job control-plane tools answer from the job store, so they must stay reachable while
+            // the worker is inside a long evaluation. That is the point of a separate control plane.
+            if (!request.contains("params") || !request["params"].is_object()) {
+                return true;
+            }
+            const auto& params = request["params"];
+            if (params.contains("name") && params["name"].is_string()) {
+                return !ToolDispatcher::is_control_plane_tool(params["name"].get<std::string>());
+            }
+            return true;
+        }
+        return method == "tools/list" || method == "resources/list" || method == "resources/read";
     };
 
     // Last line of defence: an exception that escapes a dispatch terminates the process and drops
@@ -151,6 +171,7 @@ int serve()
         }
         jobs_cv.notify_all();
         worker.join();
+        tools.shutdown();
     };
 
     for (;;) {
@@ -180,7 +201,7 @@ int serve()
             request.is_object() && request.contains("method") && request["method"].is_string()
                 ? request["method"].get<std::string>()
                 : std::string();
-        if (needs_worker(method)) {
+        if (request.is_object() && needs_worker(request, method)) {
             {
                 std::lock_guard<std::mutex> lock(jobs_mutex);
                 jobs.push(std::move(request));
