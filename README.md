@@ -229,8 +229,16 @@ build/jjmcp serve --transcript ~/jjmcp-transcript.log           # text
 JJMCP_TRANSCRIPT=calls.jsonl JJMCP_TRANSCRIPT_FORMAT=jsonl build/jjmcp serve
 ```
 
+Without the option or `JJMCP_TRANSCRIPT`, the server reads `~/.jjmcp/settings.json` at start:
+
+```json
+{ "transcript": "/Users/me/.jjmcp/transcript.log", "transcript_format": "text" }
+```
+
+That file also applies when a client relaunches the server with the arguments it started with.
 Relative paths are taken from the server's working directory. A running server starts or stops one
-with `jjmcp_transcript`; `jjmcp_status` shows the current file. A text entry:
+with `jjmcp_transcript`; `jjmcp_status` shows the current file. At start the server announces
+`notifications/tools/list_changed`, so a client that relaunched it fetches its current tool list. A text entry:
 
 ```text
 ==== 2026-10-09T19:30:26+0200 #2 jjmcp_eval pane julia:0.0 (%3) ====

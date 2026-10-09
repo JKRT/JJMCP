@@ -28,6 +28,30 @@ void append_block(std::ostringstream& out, const std::string& text)
 
 } // namespace
 
+TranscriptSettings transcript_settings_from_file(const std::filesystem::path& file)
+{
+    TranscriptSettings settings;
+    std::ifstream in(file);
+    if (!in) {
+        return settings;
+    }
+    try {
+        nlohmann::json doc;
+        in >> doc;
+        if (doc.is_object()) {
+            if (doc.contains("transcript") && doc["transcript"].is_string()) {
+                settings.path = doc["transcript"].get<std::string>();
+            }
+            if (doc.contains("transcript_format") && doc["transcript_format"].is_string()) {
+                settings.format = doc["transcript_format"].get<std::string>();
+            }
+        }
+    } catch (const std::exception&) {
+        return TranscriptSettings{};
+    }
+    return settings;
+}
+
 TranscriptFormat transcript_format_from_string(const std::string& name)
 {
     return name == "jsonl" ? TranscriptFormat::Jsonl : TranscriptFormat::Text;

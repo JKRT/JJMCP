@@ -447,6 +447,20 @@ void test_transcript_append()
     std::filesystem::remove_all(dir);
 }
 
+void test_transcript_settings_file()
+{
+    const auto dir = std::filesystem::temp_directory_path() / ("jjmcp-settings-test-" + std::to_string(::getpid()));
+    std::filesystem::create_directories(dir);
+    const auto file = dir / "settings.json";
+    check(jjmcp::transcript_settings_from_file(file).path.empty(), "no settings file, no transcript");
+    std::ofstream(file) << "{\"transcript\": \"/tmp/t.log\", \"transcript_format\": \"jsonl\"}";
+    const auto settings = jjmcp::transcript_settings_from_file(file);
+    check(settings.path == "/tmp/t.log" && settings.format == "jsonl", "settings file gives the transcript and format");
+    std::ofstream(file) << "{not json";
+    check(jjmcp::transcript_settings_from_file(file).path.empty(), "an unreadable settings file gives no transcript");
+    std::filesystem::remove_all(dir);
+}
+
 void test_transcript_tool()
 {
     const auto dir = std::filesystem::temp_directory_path()
@@ -504,6 +518,7 @@ int main()
     test_transcript_jsonl_format();
     test_transcript_output_cap();
     test_transcript_append();
+    test_transcript_settings_file();
     test_transcript_tool();
 
     if (failures != 0) {

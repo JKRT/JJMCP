@@ -33,6 +33,14 @@ std::string transcript_format_name(TranscriptFormat format);
 // Largest output recorded per entry; longer output keeps its end with a truncation note.
 constexpr std::size_t kMaxTranscriptOutputBytes = 8 * 1024 * 1024;
 
+// The transcript settings in a settings file (JSON: "transcript" path, optional
+// "transcript_format"); empty fields when the file or the keys are missing or unreadable.
+struct TranscriptSettings {
+    std::string path;
+    std::string format;
+};
+TranscriptSettings transcript_settings_from_file(const std::filesystem::path& file);
+
 // One entry as written to the transcript file (no I/O).
 std::string format_transcript_entry(const TranscriptEntry& entry, TranscriptFormat format);
 

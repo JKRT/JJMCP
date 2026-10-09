@@ -100,6 +100,10 @@ std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request
     const bool notification = is_notification(request);
 
     if (method == "notifications/initialized") {
+        // A client that reconnects a restarted server can keep the tool list it had before: have it
+        // fetch the current one (a rebuilt server can bring new tools).
+        std::lock_guard<std::mutex> guard(stdout_mutex);
+        write_mcp_message(std::cout, {{"jsonrpc", "2.0"}, {"method", "notifications/tools/list_changed"}});
         return std::nullopt;
     }
 
@@ -111,7 +115,7 @@ std::optional<nlohmann::json> dispatch_mcp_request(const nlohmann::json& request
         nlohmann::json result;
         result["protocolVersion"] = "2024-11-05";
         result["capabilities"] = {
-            {"tools", nlohmann::json::object()},
+            {"tools", {{"listChanged", true}}},
             {"resources", {{"listChanged", false}}},
         };
         result["serverInfo"] = {{"name", "JohnJuliaMCP"}, {"version", "0.1.0"}};

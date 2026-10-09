@@ -38,7 +38,11 @@ void print_usage()
         << "  JJMCP_TIMEOUT_MS_MAX      Override the per-tool timeout_ms upper bound (default 600000).\n"
         << "  JJMCP_LOG_FORMAT          Set to 'json' for one-JSON-object-per-line stderr logs (default 'text').\n"
         << "  JJMCP_TRANSCRIPT          Transcript file, as --transcript (the option wins).\n"
-        << "  JJMCP_TRANSCRIPT_FORMAT   text (default) or jsonl, as --transcript-format.\n";
+        << "  JJMCP_TRANSCRIPT_FORMAT   text (default) or jsonl, as --transcript-format.\n"
+        << "\n"
+        << "Files:\n"
+        << "  ~/.jjmcp/settings.json    {\"transcript\": PATH, \"transcript_format\": \"text\"|\"jsonl\"}, used when\n"
+        << "                            neither the option nor JJMCP_TRANSCRIPT gives a transcript.\n";
 }
 
 struct ServeOptions {
@@ -55,6 +59,17 @@ std::optional<ServeOptions> parse_serve_options(int argc, char** argv)
     }
     if (const char* env = std::getenv("JJMCP_TRANSCRIPT_FORMAT")) {
         options.transcript_format = env;
+    }
+    // Last, the user's settings file: it applies also when a client relaunches the server with
+    // the arguments and environment it started with.
+    if (options.transcript.empty()) {
+        if (const char* home = std::getenv("HOME")) {
+            const auto settings = jjmcp::transcript_settings_from_file(std::filesystem::path(home) / ".jjmcp" / "settings.json");
+            options.transcript = settings.path;
+            if (options.transcript_format.empty()) {
+                options.transcript_format = settings.format;
+            }
+        }
     }
     for (int i = 2; i < argc; ++i) {
         const std::string arg = argv[i];
