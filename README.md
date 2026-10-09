@@ -245,7 +245,9 @@ The `jsonl` format writes one JSON object per call with `ts`, `seq`, `tool`, `ta
 
 ## Notes
 
-The server sends code by loading a tmux buffer and pasting it into the bound pane. Evaluation output
+The server sends code by loading a tmux buffer and pasting it into the bound pane as a bracketed
+paste (waiting until the REPL has bracketed paste on), so the REPL reads it as one input. tmux
+format fields are separated by a printable marker: tmux 3.7 prints tabs in format output as `_`. Evaluation output
 is isolated by marker lines emitted inside `@JJMCP_COMMAND` and returned as MCP text content. Julia
 exceptions are captured as tool errors with the Julia error text.
 

@@ -169,6 +169,16 @@ void test_tmux_argv()
     check(argv[0] == "tmux" && argv[1] == "display-message" && argv[2] == "-p", "tmux argv contents");
 }
 
+void test_split_tmux_fields()
+{
+    const std::string sep = jjmcp::kTmuxFieldSep;
+    const auto fields = jjmcp::split_tmux_fields("%3" + sep + "my session" + sep + "" + sep + "/a b/c\n");
+    check(fields.size() == 4 && fields[0] == "%3" && fields[1] == "my session" && fields[2].empty()
+              && fields[3] == "/a b/c",
+          "tmux fields split at the separator, empty fields and line end handled");
+    check(jjmcp::split_tmux_fields("one").size() == 1, "a line without separator is one field");
+}
+
 void test_socket_default_path()
 {
     using jjmcp::SocketClient;
@@ -482,6 +492,7 @@ int main()
     test_tmux_argv();
     test_compute_capture_overlap();
     test_make_test_code();
+    test_split_tmux_fields();
     test_socket_default_path();
     test_parse_test_summary_pass_only();
     test_parse_test_summary_with_failure();

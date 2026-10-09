@@ -32,6 +32,8 @@ public:
     Result<std::string> list_all() const;
     Result<PaneInfo> pane_info(const std::string& target) const;
     Result<std::string> capture_pane(const std::string& target, int lines) const;
+    // Waits until the pane's application has bracketed paste on; false after the timeout.
+    bool wait_for_bracketed_paste(const std::string& target, std::chrono::milliseconds timeout) const;
     Result<void> send_text(const std::string& target, const std::string& text, const std::string& buffer_name) const;
     Result<void> send_ctrl_c(const std::string& target) const;
     // Send a single tmux key spec (e.g. "BSpace", "Enter", "C-c") to the bound pane.
@@ -47,5 +49,12 @@ private:
 };
 
 std::vector<std::string> make_tmux_argv(const std::vector<std::string>& args);
+
+// Separates the fields of tmux format output. Printable: tmux 3.7 prints control characters
+// in format output, tabs included, as '_'.
+inline constexpr const char* kTmuxFieldSep = "<jjmcp|sep>";
+
+// One line of format output split at kTmuxFieldSep (line ends dropped).
+std::vector<std::string> split_tmux_fields(const std::string& line);
 
 } // namespace jjmcp
