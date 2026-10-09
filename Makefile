@@ -31,7 +31,8 @@ LIB_SRCS := \
 	$(SRC_DIR)/socket_client.cpp \
 	$(SRC_DIR)/state.cpp \
 	$(SRC_DIR)/tmux.cpp \
-	$(SRC_DIR)/tools.cpp
+	$(SRC_DIR)/tools.cpp \
+	$(SRC_DIR)/transcript.cpp
 
 APP_SRCS := $(SRC_DIR)/main.cpp $(LIB_SRCS)
 TEST_SRCS := $(TEST_DIR)/test_main.cpp $(LIB_SRCS)

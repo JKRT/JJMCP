@@ -7,6 +7,10 @@ jjmcp \- local MCP server for a tmux Julia REPL
 .br
 .B jjmcp
 .B serve
+.RB [ \-\-transcript
+.IR path ]
+.RB [ \-\-transcript\-format
+.IR text | jsonl ]
 .SH DESCRIPTION
 .B JohnJuliaMCP
 (
@@ -26,6 +30,18 @@ Print usage to stdout and exit.
 .TP
 .B serve
 Run MCP over stdio.
+.TP
+.BI \-\-transcript " path"
+Append every tool call and its result to
+.I path
+(see TRANSCRIPT).
+Overrides
+.B JJMCP_TRANSCRIPT.
+.TP
+.BI \-\-transcript\-format " text|jsonl"
+Transcript format, default text.
+Overrides
+.B JJMCP_TRANSCRIPT_FORMAT.
 .SH MCP TOOLS
 .TP
 .B jjmcp_list_tmux
@@ -75,6 +91,41 @@ in the bound pane.
 .TP
 .B jjmcp_test
 Run focused Julia tests in the existing REPL context.
+.TP
+.B jjmcp_transcript
+Start the transcript
+.RB ( path ,
+optional
+.BR format ),
+stop it
+.RB ( enabled
+false), or report it (no arguments).
+.SH TRANSCRIPT
+The transcript records every tool call: its time, tool and bound pane, the Julia code JJMCP sent or the
+tool's arguments, and the result before the MCP size limits (up to 8 MiB per call, keeping the end).
+Entries are appended; the file can be read, truncated, or rotated while the server runs.
+Relative paths are taken from the server's working directory.
+.B jjmcp_status
+shows the current file.
+.SH ENVIRONMENT
+.TP
+.B JJMCP_TIMEOUT_MS_MAX
+Upper bound on tool
+.B timeout_ms
+(default 600000).
+.TP
+.B JJMCP_LOG_FORMAT
+.B json
+for one JSON object per stderr log line (default text).
+.TP
+.B JJMCP_TRANSCRIPT
+Transcript file, as
+.B \-\-transcript.
+.TP
+.B JJMCP_TRANSCRIPT_FORMAT
+.B text
+(default) or
+.B jsonl.
 .SH LONG RUNS
 Eval-style tools accept
 .B timeout_ms.
@@ -87,7 +138,7 @@ to allow longer calls.
 .PP
 When eval output is larger than the MCP response budget, JJMCP returns the end of the captured output
 and includes a truncation marker for omitted earlier lines or bytes.
-The full output remains visible in the bound tmux pane scrollback.
+The full output remains visible in the bound tmux pane scrollback, and in the transcript when one is enabled.
 .SH EXAMPLES
 .nf
 tmux new-session -s julia

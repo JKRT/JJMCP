@@ -194,6 +194,8 @@ therefore do not appear as `@JJMCP_COMMAND` calls.
 - `jjmcp_activate`: run `using Pkg; Pkg.activate(path)` through `@JJMCP_COMMAND`.
 - `jjmcp_test`: run `test_expr`, include a test file, or run `Pkg.test()` through `@JJMCP_COMMAND`.
 - `jjmcp_pkg_status`: run `using Pkg; Pkg.status()` through `@JJMCP_COMMAND`.
+- `jjmcp_transcript`: start (`path`, optional `format`), stop (`enabled: false`) or report the transcript
+  file (see Transcript).
 - `jjmcp_capture_test_results`: parse the latest Julia `Test Summary:` block from tmux output and return
   structured fields like `found_summary`, `test_pass`, `test_fail`, `test_total`, `status`, and `failures`.
 - `require_summary` defaults to `false`; when set to `true`, missing summaries return a tool error. `include_raw`
@@ -210,7 +212,36 @@ JJMCP_TIMEOUT_MS_MAX=14400000 build/jjmcp serve
 
 That example allows calls up to four hours when the client passes a matching `timeout_ms`.
 Oversized eval output is returned from the end of the captured output, with a truncation marker for
-omitted earlier lines or bytes. The full output remains visible in the bound tmux pane scrollback.
+omitted earlier lines or bytes. The full output remains visible in the bound tmux pane scrollback,
+and in the transcript file when one is enabled.
+
+## Transcript
+
+A transcript file records every tool call: its time, tool and bound pane, the Julia code JJMCP sent
+(also for `jjmcp_revise`, `jjmcp_activate`, `jjmcp_test`, and `jjmcp_pkg_status`) or the tool's
+arguments, and the result. The result is the eval output before the MCP size limits, so output that
+scrolled out of the pane or was cut from the tool response is still there (up to 8 MiB per call,
+keeping the end). Entries are appended; the file can be read, truncated, or rotated while the server
+runs.
+
+```sh
+build/jjmcp serve --transcript ~/jjmcp-transcript.log           # text
+JJMCP_TRANSCRIPT=calls.jsonl JJMCP_TRANSCRIPT_FORMAT=jsonl build/jjmcp serve
+```
+
+Relative paths are taken from the server's working directory. A running server starts or stops one
+with `jjmcp_transcript`; `jjmcp_status` shows the current file. A text entry:
+
+```text
+==== 2026-10-09T19:30:26+0200 #2 jjmcp_eval pane julia:0.0 (%3) ====
+>>> code
+1 + 1
+<<< ok, 41 ms, tmux
+2
+```
+
+The `jsonl` format writes one JSON object per call with `ts`, `seq`, `tool`, `target`, `code` or
+`arguments`, `ok`, `elapsed_ms`, `transport`, and `output`.
 
 ## Notes
 

@@ -4,6 +4,7 @@
 #include "socket_client.hpp"
 #include "state.hpp"
 #include "tmux.hpp"
+#include "transcript.hpp"
 
 #include <filesystem>
 #include <nlohmann/json.hpp>
@@ -19,13 +20,21 @@ struct ToolResult {
     // Optional structured payload. Emitted as MCP `structuredContent` when not null.
     // Default-constructed nlohmann::json is null; use with_structured() to attach.
     nlohmann::json structured;
+    // The output before the MCP size limits, for the transcript; empty means `text` is complete.
+    std::string full_output;
 
-    static ToolResult success(std::string text) { return ToolResult{false, std::move(text), {}}; }
-    static ToolResult error(std::string text) { return ToolResult{true, std::move(text), {}}; }
+    static ToolResult success(std::string text) { return ToolResult{false, std::move(text), {}, {}}; }
+    static ToolResult error(std::string text) { return ToolResult{true, std::move(text), {}, {}}; }
 
     ToolResult& with_structured(nlohmann::json s)
     {
         structured = std::move(s);
+        return *this;
+    }
+
+    ToolResult& with_full_output(std::string s)
+    {
+        full_output = std::move(s);
         return *this;
     }
 };
@@ -76,6 +85,9 @@ public:
     nlohmann::json list_resources_json() const;
     Result<nlohmann::json> read_resource(const std::string& uri) const;
 
+    // Log of tool calls and results (JJMCP_TRANSCRIPT, serve --transcript, jjmcp_transcript).
+    Transcript& transcript() { return transcript_; }
+
 private:
     ToolResult list_tmux() const;
     ToolResult bind(const nlohmann::json& arguments);
@@ -88,6 +100,10 @@ private:
     ToolResult activate(const nlohmann::json& arguments);
     ToolResult test(const nlohmann::json& arguments);
     ToolResult pkg_status(const nlohmann::json& arguments);
+    ToolResult transcript_tool(const nlohmann::json& arguments);
+    ToolResult dispatch(const std::string& name, const nlohmann::json& arguments);
+    void record_transcript(const std::string& name, const nlohmann::json& arguments,
+                           const ToolResult& result, long long elapsed_ms);
 
     ToolResult eval_code(const std::string& code, int timeout_ms, int capture_lines,
                          bool force = false, ProgressEmitter* progress = nullptr,
@@ -102,6 +118,9 @@ private:
     // progress notifications. Null if the client did not pass a progressToken.
     ProgressEmitter* current_progress_ = nullptr;
     RuntimeBootstrapCache tmux_runtime_bootstrapped_;
+    Transcript transcript_;
+    // The Julia code eval_code() sent during the current dispatch, for the transcript.
+    std::string last_code_;
 };
 
 } // namespace jjmcp

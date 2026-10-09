@@ -3,9 +3,13 @@
 #include "socket_client.hpp"
 #include "tmux.hpp"
 #include "tools.hpp"
+#include "transcript.hpp"
 
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -335,6 +339,137 @@ void test_encode_mcp_frame_tolerates_invalid_utf8()
 
 } // namespace
 
+std::string read_file(const std::filesystem::path& path)
+{
+    std::ifstream in(path, std::ios::binary);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    return ss.str();
+}
+
+void test_transcript_text_format()
+{
+    jjmcp::TranscriptEntry entry;
+    entry.timestamp = "2026-10-09T20:00:00+0200";
+    entry.sequence = 3;
+    entry.tool = "jjmcp_eval";
+    entry.target = "bldjj:julia (%3)";
+    entry.code = "x = 1\nprintln(x)";
+    entry.elapsed_ms = 12;
+    entry.transport = "tmux";
+    entry.output = "1";
+    const auto text = jjmcp::format_transcript_entry(entry, jjmcp::TranscriptFormat::Text);
+    check(text.rfind("==== 2026-10-09T20:00:00+0200 #3 jjmcp_eval pane bldjj:julia (%3) ====\n", 0) == 0,
+          "transcript text header names the time, number, tool and pane");
+    check(text.find(">>> code\nx = 1\nprintln(x)\n") != std::string::npos, "transcript text has the code");
+    check(text.find("<<< ok, 12 ms, tmux\n1\n") != std::string::npos, "transcript text has the status and output");
+
+    entry.code.clear();
+    entry.arguments = {{"lines", 200}};
+    entry.is_error = true;
+    entry.transport.clear();
+    const auto args = jjmcp::format_transcript_entry(entry, jjmcp::TranscriptFormat::Text);
+    check(args.find(">>> arguments {\"lines\":200}\n") != std::string::npos,
+          "transcript text has the arguments when no code was sent");
+    check(args.find("<<< error, 12 ms\n") != std::string::npos, "transcript text marks errors");
+}
+
+void test_transcript_jsonl_format()
+{
+    jjmcp::TranscriptEntry entry;
+    entry.timestamp = "t";
+    entry.sequence = 1;
+    entry.tool = "jjmcp_eval";
+    entry.code = "1 + 1";
+    entry.output = "2\n";
+    entry.transport = "socket";
+    const auto line = jjmcp::format_transcript_entry(entry, jjmcp::TranscriptFormat::Jsonl);
+    check(!line.empty() && line.back() == '\n' && line.find('\n') == line.size() - 1,
+          "transcript jsonl entry is one line");
+    const auto doc = nlohmann::json::parse(line);
+    check(doc["code"] == "1 + 1" && doc["output"] == "2\n" && doc["ok"] == true && doc["transport"] == "socket"
+              && !doc.contains("arguments"),
+          "transcript jsonl entry has code, output, status and transport");
+
+    entry.output = std::string("bad \xff byte");
+    const auto replaced = jjmcp::format_transcript_entry(entry, jjmcp::TranscriptFormat::Jsonl);
+    check(nlohmann::json::accept(replaced), "transcript jsonl survives invalid UTF-8 in the output");
+}
+
+void test_transcript_output_cap()
+{
+    jjmcp::TranscriptEntry entry;
+    entry.tool = "jjmcp_eval";
+    entry.output = std::string(jjmcp::kMaxTranscriptOutputBytes + 10, 'a') + "END";
+    const auto text = jjmcp::format_transcript_entry(entry, jjmcp::TranscriptFormat::Text);
+    check(text.find("[jjmcp transcript: 13 earlier bytes omitted]") != std::string::npos,
+          "transcript notes the omitted head of a long output");
+    check(text.find("END\n") != std::string::npos, "transcript keeps the end of a long output");
+}
+
+void test_transcript_append()
+{
+    const auto dir = std::filesystem::temp_directory_path()
+        / ("jjmcp-transcript-test-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    const auto path = dir / "sub" / "transcript.log";
+
+    jjmcp::Transcript transcript;
+    check(!transcript.enabled(), "transcript starts disabled");
+    jjmcp::TranscriptEntry entry;
+    entry.tool = "jjmcp_status";
+    check(static_cast<bool>(transcript.append(entry)) && !std::filesystem::exists(path),
+          "a disabled transcript writes nothing");
+
+    transcript.enable(path, jjmcp::TranscriptFormat::Text);
+    check(transcript.enabled() && transcript.path() == path, "transcript enabled at its path");
+    check(static_cast<bool>(transcript.append(entry)), "first transcript append succeeds");
+    entry.tool = "jjmcp_capture";
+    check(static_cast<bool>(transcript.append(entry)), "second transcript append succeeds");
+    const auto content = read_file(path);
+    check(content.find("#1 jjmcp_status") != std::string::npos && content.find("#2 jjmcp_capture") != std::string::npos,
+          "transcript appends numbered entries, creating its directory");
+
+    transcript.disable();
+    entry.tool = "jjmcp_interrupt";
+    (void)transcript.append(entry);
+    check(read_file(path).find("jjmcp_interrupt") == std::string::npos, "a disabled transcript stops writing");
+    std::filesystem::remove_all(dir);
+}
+
+void test_transcript_tool()
+{
+    const auto dir = std::filesystem::temp_directory_path()
+        / ("jjmcp-transcript-tool-test-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    jjmcp::ServerState state;
+    state.config_path = jjmcp::default_config_path(dir);
+    const jjmcp::Tmux tmux;
+    jjmcp::ToolDispatcher tools(state, tmux, dir);
+
+    const auto started = tools.call("jjmcp_transcript", {{"path", "calls.log"}});
+    check(!started.is_error && started.structured["enabled"] == true
+              && started.structured["path"] == (dir / "calls.log").string(),
+          "jjmcp_transcript starts a transcript relative to the working directory");
+    const auto status = tools.call("jjmcp_status", nlohmann::json::object());
+    check(status.text.find("transcript: " + (dir / "calls.log").string() + " (text)") != std::string::npos,
+          "jjmcp_status reports the transcript");
+    const auto eval = tools.call("jjmcp_eval", {{"code", "1 + 1"}});
+    check(eval.is_error, "jjmcp_eval without a binding is an error");
+    const auto log = read_file(dir / "calls.log");
+    check(log.find("jjmcp_transcript") != std::string::npos && log.find("jjmcp_status") != std::string::npos,
+          "the transcript records each tool call");
+    check(log.find(">>> code\n1 + 1\n<<< error") != std::string::npos,
+          "the transcript records the code of a failed eval");
+
+    const auto bad = tools.call("jjmcp_transcript", {{"format", "xml"}});
+    check(bad.is_error, "jjmcp_transcript rejects an unknown format");
+    const auto stopped = tools.call("jjmcp_transcript", {{"enabled", false}});
+    check(!stopped.is_error && stopped.structured["enabled"] == false, "jjmcp_transcript stops the transcript");
+    std::filesystem::remove_all(dir);
+}
+
 int main()
 {
     test_julia_string_literal();
@@ -354,6 +489,11 @@ int main()
     test_runtime_bootstrap_cache();
     test_pane_foreground_generation();
     test_encode_mcp_frame_tolerates_invalid_utf8();
+    test_transcript_text_format();
+    test_transcript_jsonl_format();
+    test_transcript_output_cap();
+    test_transcript_append();
+    test_transcript_tool();
 
     if (failures != 0) {
         std::cerr << failures << " test(s) failed\n";

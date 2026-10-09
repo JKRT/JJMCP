@@ -16,6 +16,9 @@ Imperative shell:
 - `tmux`: the only boundary that invokes `tmux`.
 - `state`: in-memory binding plus `.jjmcp/config.json` persistence.
 - `tools`: validates MCP tool arguments, coordinates tmux calls, and updates server state.
+- `transcript`: appends each tool call (the code sent or the arguments) and its untruncated result to
+  an optional file. `ToolDispatcher::call` records every dispatch; eval-style results carry their
+  output before the MCP limits in `ToolResult::full_output`.
 
 The server intentionally sends work into the user's existing tmux Julia REPL instead of creating hidden Julia workers. This keeps package state, Revise state, loaded modules, active project, and user-visible output aligned with the workflow the user already controls.
 

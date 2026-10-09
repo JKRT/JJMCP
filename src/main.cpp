@@ -11,6 +11,7 @@
 #include <iostream>
 #include <mutex>
 #include <nlohmann/json.hpp>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
@@ -24,14 +25,52 @@ void print_usage()
         << "\n"
         << "Usage:\n"
         << "  jjmcp --help\n"
-        << "  jjmcp serve\n"
+        << "  jjmcp serve [--transcript PATH] [--transcript-format text|jsonl]\n"
         << "\n"
         << "Commands:\n"
         << "  serve   Run MCP JSON-RPC over stdio. stdout is reserved for MCP frames.\n"
         << "\n"
+        << "Options:\n"
+        << "  --transcript PATH         Append every tool call (code or arguments) and its result to PATH.\n"
+        << "  --transcript-format FMT   text (default) or jsonl.\n"
+        << "\n"
         << "Environment:\n"
-        << "  JJMCP_TIMEOUT_MS_MAX  Override the per-tool timeout_ms upper bound (default 600000).\n"
-        << "  JJMCP_LOG_FORMAT      Set to 'json' for one-JSON-object-per-line stderr logs (default 'text').\n";
+        << "  JJMCP_TIMEOUT_MS_MAX      Override the per-tool timeout_ms upper bound (default 600000).\n"
+        << "  JJMCP_LOG_FORMAT          Set to 'json' for one-JSON-object-per-line stderr logs (default 'text').\n"
+        << "  JJMCP_TRANSCRIPT          Transcript file, as --transcript (the option wins).\n"
+        << "  JJMCP_TRANSCRIPT_FORMAT   text (default) or jsonl, as --transcript-format.\n";
+}
+
+struct ServeOptions {
+    std::string transcript;
+    std::string transcript_format;
+};
+
+// Parses serve's options; nullopt on an unknown option or a missing or invalid value.
+std::optional<ServeOptions> parse_serve_options(int argc, char** argv)
+{
+    ServeOptions options;
+    if (const char* env = std::getenv("JJMCP_TRANSCRIPT")) {
+        options.transcript = env;
+    }
+    if (const char* env = std::getenv("JJMCP_TRANSCRIPT_FORMAT")) {
+        options.transcript_format = env;
+    }
+    for (int i = 2; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if ((arg == "--transcript" || arg == "--transcript-format") && i + 1 < argc) {
+            (arg == "--transcript" ? options.transcript : options.transcript_format) = argv[++i];
+        } else {
+            std::cerr << "jjmcp serve: unknown option or missing value: " << arg << '\n';
+            return std::nullopt;
+        }
+    }
+    if (!options.transcript_format.empty() && options.transcript_format != "text"
+        && options.transcript_format != "jsonl") {
+        std::cerr << "jjmcp serve: transcript format must be text or jsonl\n";
+        return std::nullopt;
+    }
+    return options;
 }
 
 void apply_env_overrides(jjmcp::ServerState& state)
@@ -52,7 +91,7 @@ void apply_env_overrides(jjmcp::ServerState& state)
     }
 }
 
-int serve()
+int serve(const ServeOptions& options)
 {
     using namespace jjmcp;
 
@@ -86,6 +125,15 @@ int serve()
                {"bound", state.binding.has_value()}});
 
     ToolDispatcher tools(state, tmux, ec ? std::filesystem::path(".") : cwd);
+    if (!options.transcript.empty()) {
+        std::filesystem::path path(options.transcript);
+        if (path.is_relative()) {
+            path = (ec ? std::filesystem::path(".") : cwd) / path;
+        }
+        const auto format = transcript_format_from_string(options.transcript_format);
+        tools.transcript().enable(path, format);
+        log::info("transcript_enabled", {{"path", path.string()}, {"format", transcript_format_name(format)}});
+    }
 
     // All stdout writes (final responses on either thread, plus progress frames emitted from inside
     // a running tool call) serialize on this mutex so concurrent frames cannot interleave byte-wise.
@@ -202,8 +250,12 @@ int main(int argc, char** argv)
         return 0;
     }
 
-    if (argc == 2 && std::string(argv[1]) == "serve") {
-        return serve();
+    if (argc >= 2 && std::string(argv[1]) == "serve") {
+        const auto options = parse_serve_options(argc, argv);
+        if (!options) {
+            return 2;
+        }
+        return serve(*options);
     }
 
     print_usage();

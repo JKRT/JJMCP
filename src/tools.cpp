@@ -710,6 +710,18 @@ nlohmann::json ToolDispatcher::list_tools_json() const
         eval_output_schema()));
 
     tools.push_back(tool_schema(
+        "jjmcp_transcript",
+        "Log every tool call to a file: the Julia code sent (or the tool's arguments) and the result, "
+        "untruncated where the transport kept it. Without arguments, report the current transcript. "
+        "JJMCP_TRANSCRIPT or `serve --transcript PATH` enable it at start.",
+        object_schema(
+            {
+                {"path", {{"type", "string"}, {"description", "file to append to (relative paths from the server's working directory); starts the transcript"}}},
+                {"format", {{"type", "string"}, {"enum", nlohmann::json::array({"text", "jsonl"})}, {"description", "text (default) or jsonl"}}},
+                {"enabled", {{"type", "boolean"}, {"description", "false stops the transcript"}}},
+            })));
+
+    tools.push_back(tool_schema(
         "jjmcp_pkg_status",
         "Run `using Pkg; Pkg.status()` in the bound Julia pane and return the status text in the structured stdout field.",
         object_schema(
@@ -726,6 +738,48 @@ ToolResult ToolDispatcher::call(const std::string& name, const nlohmann::json& a
                                 ProgressEmitter* progress)
 {
     current_progress_ = progress;
+    last_code_.clear();
+    const auto start = std::chrono::steady_clock::now();
+    ToolResult result = dispatch(name, arguments);
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - start).count();
+    record_transcript(name, arguments, result, elapsed);
+    return result;
+}
+
+void ToolDispatcher::record_transcript(const std::string& name, const nlohmann::json& arguments,
+                                       const ToolResult& result, const long long elapsed_ms)
+{
+    if (!transcript_.enabled()) {
+        return;
+    }
+    TranscriptEntry entry;
+    entry.timestamp = timestamp_now();
+    entry.tool = name;
+    if (state_.binding) {
+        entry.target = state_.binding->target;
+        if (!state_.binding->pane_id.empty() && state_.binding->pane_id != state_.binding->target) {
+            entry.target += " (" + state_.binding->pane_id + ")";
+        }
+    }
+    entry.code = last_code_;
+    if (entry.code.empty()) {
+        entry.arguments = arguments;
+    }
+    entry.is_error = result.is_error;
+    entry.elapsed_ms = elapsed_ms;
+    if (result.structured.is_object() && result.structured.contains("transport")
+        && result.structured["transport"].is_string()) {
+        entry.transport = result.structured["transport"].get<std::string>();
+    }
+    entry.output = result.full_output.empty() ? result.text : result.full_output;
+    if (const auto written = transcript_.append(std::move(entry)); !written) {
+        log::warn("transcript_write_failed", {{"error", written.error()}});
+    }
+}
+
+ToolResult ToolDispatcher::dispatch(const std::string& name, const nlohmann::json& arguments)
+{
     if (name == "jjmcp_list_tmux") {
         return list_tmux();
     }
@@ -759,7 +813,48 @@ ToolResult ToolDispatcher::call(const std::string& name, const nlohmann::json& a
     if (name == "jjmcp_pkg_status") {
         return pkg_status(arguments);
     }
+    if (name == "jjmcp_transcript") {
+        return transcript_tool(arguments);
+    }
     return ToolResult::error("unknown tool: " + name);
+}
+
+ToolResult ToolDispatcher::transcript_tool(const nlohmann::json& arguments)
+{
+    const auto report = [this](const std::string& prefix) {
+        const bool on = transcript_.enabled();
+        const std::string path = transcript_.path().string();
+        const std::string format = transcript_format_name(transcript_.format());
+        std::string text = prefix + (on ? "transcript: " + path + " (" + format + ")" : "transcript: off");
+        return ToolResult::success(std::move(text))
+            .with_structured({{"enabled", on}, {"path", path}, {"format", format}});
+    };
+
+    const std::string format_arg = optional_string(arguments, "format");
+    if (!format_arg.empty() && format_arg != "text" && format_arg != "jsonl") {
+        return ToolResult::error("format must be one of: text, jsonl");
+    }
+    if (arguments.contains("enabled") && arguments["enabled"].is_boolean()
+        && !arguments["enabled"].get<bool>()) {
+        transcript_.disable();
+        return report("");
+    }
+    const std::string path_arg = optional_string(arguments, "path");
+    if (!path_arg.empty()) {
+        std::filesystem::path path(path_arg);
+        if (path.is_relative()) {
+            path = cwd_ / path;
+        }
+        const auto format = format_arg.empty() ? transcript_.format() : transcript_format_from_string(format_arg);
+        transcript_.enable(path, format);
+        log::info("transcript_enabled", {{"path", path.string()}, {"format", transcript_format_name(format)}});
+    } else if (!format_arg.empty()) {
+        if (!transcript_.enabled()) {
+            return ToolResult::error("no transcript is enabled; pass path to start one");
+        }
+        transcript_.enable(transcript_.path(), transcript_format_from_string(format_arg));
+    }
+    return report("");
 }
 
 ToolResult ToolDispatcher::list_tmux() const
@@ -818,6 +913,10 @@ ToolResult ToolDispatcher::status() const
     out << "config_path: " << state_.config_path.string() << '\n';
     out << "last_marker: " << state_.last_marker << '\n';
     out << "last_command_timestamp: " << state_.last_command_timestamp << '\n';
+    out << "transcript: "
+        << (transcript_.enabled() ? transcript_.path().string() + " (" + transcript_format_name(transcript_.format()) + ")"
+                                  : std::string("off"))
+        << '\n';
 
     if (!state_.binding) {
         out << "binding: none\n";
@@ -1024,23 +1123,23 @@ ToolResult socket_response_to_tool_result(const SocketEvalResponse& resp, const 
         {"backtrace", backtrace},
         {"transport", transport_name},
     };
-    std::string text;
-    if (resp.ok) {
-        text = stdout_text;
-        if (!value_show.empty()) {
-            if (!text.empty() && text.back() != '\n') text.push_back('\n');
-            text += value_show;
+    const auto joined = [](std::string first, const std::string& second) {
+        if (!second.empty()) {
+            if (!first.empty() && first.back() != '\n') first.push_back('\n');
+            first += second;
         }
-        text = truncate_bytes_tail(text, kMaxMcpTextBytes);
-        return ToolResult::success(std::move(text)).with_structured(std::move(structured));
+        return first;
+    };
+    if (resp.ok) {
+        std::string text = truncate_bytes_tail(joined(stdout_text, value_show), kMaxMcpTextBytes);
+        return ToolResult::success(std::move(text))
+            .with_structured(std::move(structured))
+            .with_full_output(joined(resp.stdout_text, resp.value_show));
     }
-    text = error_message;
-    if (!backtrace.empty()) {
-        if (!text.empty() && text.back() != '\n') text.push_back('\n');
-        text += backtrace;
-    }
-    text = truncate_bytes_tail(text, kMaxMcpTextBytes);
-    return ToolResult::error(std::move(text)).with_structured(std::move(structured));
+    std::string text = truncate_bytes_tail(joined(error_message, backtrace), kMaxMcpTextBytes);
+    return ToolResult::error(std::move(text))
+        .with_structured(std::move(structured))
+        .with_full_output(joined(joined(resp.stdout_text, resp.error_message), resp.backtrace));
 }
 
 // The REPL rejects the pasted wrapper with an UndefVarError when Main.JJMCPRuntime is gone, which
@@ -1196,6 +1295,7 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
                                      const std::string& transport)
 {
     ProgressEmitter* progress = progress_override != nullptr ? progress_override : current_progress_;
+    last_code_ = code;
     if (!state_.binding) {
         return ToolResult::error("no tmux pane is bound; call jjmcp_bind first");
     }
@@ -1446,7 +1546,7 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
             auto text = truncate_tool_tail(last_extract.text, cap_lines);
             ToolResult result = last_extract.julia_error ? ToolResult::error(std::move(text))
                                                          : ToolResult::success(std::move(text));
-            return result.with_structured(std::move(structured));
+            return result.with_structured(std::move(structured)).with_full_output(last_extract.text);
         }
 
         std::ostringstream out;
@@ -1458,7 +1558,12 @@ ToolResult ToolDispatcher::eval_code(const std::string& code, int timeout_ms, in
             out << "\nRecent pane output:\n";
             out << truncate_tool_tail(last_capture, static_cast<std::size_t>(std::min(capture_lines, 200)));
         }
-        return ToolResult::error(out.str()).with_structured(std::move(structured));
+        std::string full;
+        if (last_extract.found_begin && !last_extract.text.empty()) {
+            full = "Timed out after " + std::to_string(timeout_ms) + " ms; output between markers so far:\n"
+                + last_extract.text;
+        }
+        return ToolResult::error(out.str()).with_structured(std::move(structured)).with_full_output(std::move(full));
     };
 
     if (auto result = run_marker_eval(true); result) {
